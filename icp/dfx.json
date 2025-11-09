@@ -1,0 +1,27 @@
+{
+  "canisters": {
+    "intentswaps_backend": {
+      "candid": "src/intentswaps_backend/intentswaps_backend.did",
+      "package": "intentswaps_backend",
+      "type": "rust"
+    },
+    "intentswaps_frontend": {
+      "dependencies": [
+        "intentswaps_backend"
+      ],
+      "source": [
+        "src/intentswaps_frontend/dist"
+      ],
+      "type": "assets",
+      "workspace": "intentswaps_frontend"
+    }
+  },
+  "defaults": {
+    "build": {
+      "args": "",
+      "packtool": ""
+    }
+  },
+  "output_env_file": ".env",
+  "version": 1
+}
