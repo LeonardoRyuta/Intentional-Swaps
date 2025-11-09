@@ -2,16 +2,13 @@
     {
         "match": "**/*",
 
-        // Provides a base set of security headers that will work for most dapps.
-        // Any headers you manually specify will override the headers provided by the policy.
-        // See 'dfx info security-policy' to see the policy and for advice on how to harden the headers.
-        // Once you improved the headers for your dapp, set the security policy to "hardened" to disable the warning.
-        // Options are: "hardened" | "standard" | "disabled".
-        "security_policy": "standard",
+        // Custom CSP to allow CoinGecko API and ICP services
+        "headers": {
+            "Content-Security-Policy": "default-src 'self'; connect-src 'self' https://api.coingecko.com https://identity.ic0.app https://icp-api.io http://127.0.0.1:4943 http://localhost:4943 http://*.localhost:4943 https://*.ic0.app; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:;"
+        },
 
-        // Uncomment to disable the warning about using the
-        // standard security policy, if you understand the risk
-        // "disable_security_policy_warning": true,
+        // Disable the warning since we've customized the policy
+        "disable_security_policy_warning": true,
 
         // Uncomment to redirect all requests from .raw.icp0.io to .icp0.io
         // "allow_raw_access": false

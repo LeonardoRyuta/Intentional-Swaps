@@ -1,3 +1,62 @@
+type Chain = variant {
+    Bitcoin;
+    Solana;
+};
+
+type OrderStatus = variant {
+    Pending;
+    Accepted;
+    Completed;
+    Cancelled;
+    Expired;
+};
+
+type OrderRequest = record {
+    from_chain: Chain;
+    to_chain: Chain;
+    from_amount: nat64;
+    to_amount: nat64;
+    secret_hash: text;
+    timeout_seconds: nat64;
+};
+
+type OrderInfo = record {
+    id: nat64;
+    creator: principal;
+    from_chain: Chain;
+    to_chain: Chain;
+    from_amount: nat64;
+    to_amount: nat64;
+    secret_hash: text;
+    status: OrderStatus;
+    resolver: opt principal;
+    created_at: nat64;
+    expires_at: nat64;
+};
+
+type Result = variant {
+    Ok: nat64;
+    Err: text;
+};
+
+type Result_1 = variant {
+    Ok: text;
+    Err: text;
+};
+
 service : {
-    "greet": (text) -> (text) query;
+    // Order management
+    "create_order": (OrderRequest) -> (Result);
+    "accept_order": (nat64) -> (Result_1);
+    "reveal_secret": (nat64, text) -> (Result_1);
+    "cancel_order": (nat64) -> (Result_1);
+    
+    // Balance management
+    "deposit_funds": (Chain, nat64) -> (Result_1);
+    "get_balance": (Chain) -> (nat64) query;
+    
+    // Query orders
+    "get_pending_orders": () -> (vec OrderInfo) query;
+    "get_order": (nat64) -> (opt OrderInfo) query;
+    "get_my_orders": () -> (vec OrderInfo) query;
 }

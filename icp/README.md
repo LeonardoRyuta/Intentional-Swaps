@@ -34,6 +34,21 @@ dfx deploy
 
 Once the job completes, your application will be available at `http://localhost:4943?canisterId={asset_canister_id}`.
 
+**📝 Important**: You must include the `?canisterId=` parameter in the URL. To get the correct URLs, run:
+
+```bash
+./open-urls.sh
+```
+
+Or manually construct the URLs:
+```bash
+# Frontend
+http://localhost:4943/?canisterId=$(dfx canister id intentswaps_frontend)
+
+# Backend Candid Interface
+http://localhost:4943/?canisterId=$(dfx canister id intentswaps_backend)
+```
+
 If you have made changes to your backend canister, you can generate a new candid interface with
 
 ```bash
