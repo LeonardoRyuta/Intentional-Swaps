@@ -1,73 +1,285 @@
 import express from 'express';
 import { Actor, HttpAgent } from '@dfinity/agent';
-import { Ed25519KeyIdentity } from '@dfinity/identity';
 import { idlFactory } from './declarations/intentswaps_backend/intentswaps_backend.did.js';
-import { Principal } from '@dfinity/principal';
 import dotenv from 'dotenv';
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL, sendAndConfirmTransaction } from '@solana/web3.js';
+import * as bitcoin from 'bitcoinjs-lib';
+import { ECPairFactory } from 'ecpair';
+import * as ecc from 'tiny-secp256k1';
+import axios from 'axios';
+import bs58 from 'bs58';
 
 dotenv.config();
+
+const ECPair = ECPairFactory(ecc);
 
 const app = express();
 app.use(express.json());
 
 // Configuration
-const CANISTER_ID = process.env.CANISTER_ID || 'rrkah-fqaaa-aaaaa-aaaaq-cai'; // Replace with your canister ID
-const IC_HOST = process.env.IC_HOST || 'http://127.0.0.1:4943'; // Local replica
-const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL) || 5000; // 5 seconds
+const CANISTER_ID = process.env.CANISTER_ID || 'uxrrr-q7777-77774-qaaaq-cai';
+const IC_HOST = process.env.IC_HOST || 'http://127.0.0.1:4943';
+const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL) || 10000; // 10 seconds
+const SOLANA_RPC = process.env.SOLANA_RPC || 'https://api.devnet.solana.com';
+const BITCOIN_NETWORK = process.env.BITCOIN_NETWORK || 'testnet';
+
+// Wallet configuration
+let btcWallet = null;
+let solWallet = null;
+let btcAddress = null;
+let solAddress = null;
 
 // Resolver configuration
 const RESOLVER_CONFIG = {
-  // Minimum profit margin to accept orders (in percentage)
   minProfitMargin: parseFloat(process.env.MIN_PROFIT_MARGIN) || 0.5,
-
-  // Maximum amounts the resolver is willing to handle
-  maxBtcAmount: BigInt(process.env.MAX_BTC_AMOUNT) || BigInt(100000000), // 1 BTC in satoshis
-  maxSolAmount: BigInt(process.env.MAX_SOL_AMOUNT) || BigInt(100000000000), // 100 SOL in lamports
-
-  // Exchange rates (you'd fetch these from an oracle in production)
-  btcToSolRate: parseFloat(process.env.BTC_TO_SOL_RATE) || 6340.0, // 1 BTC = 6340 SOL
-  solToBtcRate: parseFloat(process.env.SOL_TO_BTC_RATE) || 0.000158, // 1 SOL = 0.000158 BTC
+  maxBtcAmount: BigInt(process.env.MAX_BTC_AMOUNT) || BigInt(100000000), // 1 BTC
+  maxSolAmount: BigInt(process.env.MAX_SOL_AMOUNT) || BigInt(100000000000), // 100 SOL
 };
 
 // State
 let agent;
 let actor;
+let solanaConnection;
 let isProcessing = false;
 let processedOrders = new Set();
+let acceptedOrders = new Map(); // Track orders we've accepted: orderId -> { acceptedAt, lastStatus }
+
+// Initialize Bitcoin wallet from private key (WIF format or hex)
+function initializeBitcoinWallet() {
+  const btcPrivateKey = process.env.BTC_PRIVATE_KEY;
+
+  if (!btcPrivateKey) {
+    console.warn('⚠️  BTC_PRIVATE_KEY not set, Bitcoin functionality disabled');
+    return false;
+  }
+
+  try {
+    const network = BITCOIN_NETWORK === 'mainnet'
+      ? bitcoin.networks.bitcoin
+      : bitcoin.networks.testnet;
+
+    // Remove any whitespace
+    const cleanKey = btcPrivateKey.trim();
+
+    // Try to parse the private key
+    let keyPair;
+    try {
+      // First try WIF format (most common)
+      keyPair = ECPair.fromWIF(cleanKey, network);
+    } catch (e1) {
+      try {
+        // Try as hex string (64 characters)
+        if (cleanKey.length === 64) {
+          const buffer = Buffer.from(cleanKey, 'hex');
+          keyPair = ECPair.fromPrivateKey(buffer, { network });
+        } else {
+          throw new Error('Invalid key format');
+        }
+      } catch (e2) {
+        throw new Error(`Could not parse private key. Expected WIF format (starts with 'c' for testnet, 'K'/'L' for mainnet) or 64-character hex string. Got: ${cleanKey.substring(0, 10)}...`);
+      }
+    }
+
+    btcWallet = keyPair;
+
+    // Generate P2WPKH address (Native SegWit address format)
+    const { address } = bitcoin.payments.p2wpkh({
+      pubkey: btcWallet.publicKey,
+      network
+    });
+    btcAddress = address;
+
+    console.log('✅ Bitcoin wallet initialized');
+    console.log('   Network:', BITCOIN_NETWORK);
+    console.log('   Address:', btcAddress);
+    console.log('   Address type: P2WPKH (Native SegWit)');
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to initialize Bitcoin wallet:', error.message);
+    console.error('   Make sure your private key is in WIF format');
+    console.error('   Testnet WIF starts with "c", Mainnet WIF starts with "K" or "L"');
+    return false;
+  }
+}
+
+// Initialize Solana wallet from private key (multiple formats supported)
+function initializeSolanaWallet() {
+  const solPrivateKey = process.env.SOL_PRIVATE_KEY;
+
+  if (!solPrivateKey) {
+    console.warn('⚠️  SOL_PRIVATE_KEY not set, Solana functionality disabled');
+    return false;
+  }
+
+  try {
+    const cleanKey = solPrivateKey.trim();
+    let secretKey;
+
+    // Try different formats
+    if (cleanKey.startsWith('[')) {
+      // JSON array format: [1,2,3,...]
+      try {
+        secretKey = new Uint8Array(JSON.parse(cleanKey));
+      } catch (e) {
+        throw new Error('Invalid JSON array format');
+      }
+    } else if (cleanKey.includes(',')) {
+      // Comma-separated numbers: 1,2,3,...
+      try {
+        const numbers = cleanKey.split(',').map(n => parseInt(n.trim()));
+        secretKey = new Uint8Array(numbers);
+      } catch (e) {
+        throw new Error('Invalid comma-separated format');
+      }
+    } else if (cleanKey.length === 128) {
+      // Hex format (128 characters = 64 bytes)
+      try {
+        const buffer = Buffer.from(cleanKey, 'hex');
+        secretKey = new Uint8Array(buffer);
+      } catch (e) {
+        throw new Error('Invalid hex format');
+      }
+    } else if (cleanKey.length >= 87 && cleanKey.length <= 88) {
+      // Base58 format (typical length 87-88 characters)
+      try {
+        // Use bs58 decoding (Solana's standard format)
+        secretKey = bs58.decode(cleanKey);
+      } catch (e) {
+        throw new Error('Invalid base58 format: ' + e.message);
+      }
+    } else {
+      throw new Error(`Unknown private key format. Length: ${cleanKey.length}. Expected: JSON array [1,2,3,...], comma-separated (1,2,3,...), hex (128 chars), or base58 (87-88 chars)`);
+    }
+
+    // Validate key length
+    if (secretKey.length !== 64) {
+      throw new Error(`Invalid secret key length: ${secretKey.length} bytes. Expected 64 bytes. Your key format may be incorrect.`);
+    }
+
+    solWallet = Keypair.fromSecretKey(secretKey);
+    solAddress = solWallet.publicKey.toBase58();
+    solanaConnection = new Connection(SOLANA_RPC, 'confirmed');
+
+    console.log('✅ Solana wallet initialized');
+    console.log('   Network:', SOLANA_RPC.includes('devnet') ? 'Devnet' : 'Mainnet');
+    console.log('   Address:', solAddress);
+    console.log('   Key format detected:',
+      cleanKey.startsWith('[') ? 'JSON array' :
+        cleanKey.includes(',') ? 'Comma-separated' :
+          cleanKey.length === 128 ? 'Hex' : 'Base58'
+    );
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to initialize Solana wallet:', error.message);
+    console.error('\n   Supported formats:');
+    console.error('   1. JSON array:        [1,2,3,...] (from id.json file)');
+    console.error('   2. Comma-separated:   1,2,3,...');
+    console.error('   3. Hex string:        abc123... (128 characters)');
+    console.error('   4. Base58 string:     5JK8... (87-88 characters)');
+    console.error('\n   To get your Solana private key:');
+    console.error('   - From Phantom: Settings → Show Private Key → Copy');
+    console.error('   - From CLI: cat ~/.config/solana/id.json');
+    return false;
+  }
+}
+
+// Get Bitcoin wallet balance
+async function getBitcoinBalance() {
+  if (!btcAddress) return 0;
+
+  try {
+    // Use blockstream API for testnet
+    const apiUrl = BITCOIN_NETWORK === 'mainnet'
+      ? `https://blockstream.info/api/address/${btcAddress}`
+      : `https://blockstream.info/testnet/api/address/${btcAddress}`;
+
+    const response = await axios.get(apiUrl);
+    const balanceSats = response.data.chain_stats.funded_txo_sum - response.data.chain_stats.spent_txo_sum;
+    return balanceSats;
+  } catch (error) {
+    console.error('Error fetching Bitcoin balance:', error.message);
+    return 0;
+  }
+}
+
+// Get Solana wallet balance
+async function getSolanaBalance() {
+  if (!solWallet || !solanaConnection) return 0;
+
+  try {
+    const balance = await solanaConnection.getBalance(solWallet.publicKey);
+    return balance;
+  } catch (error) {
+    console.error('Error fetching Solana balance:', error.message);
+    return 0;
+  }
+}
+
+// Send Bitcoin transaction
+async function sendBitcoinTransaction(toAddress, amountSats) {
+  if (!btcWallet || !btcAddress) {
+    throw new Error('Bitcoin wallet not initialized');
+  }
+
+  console.log(`📤 Sending ${amountSats} satoshis to ${toAddress}`);
+
+  // Note: This is a simplified version. In production, you'd need to:
+  // 1. Fetch UTXOs for your address
+  // 2. Build and sign the transaction properly
+  // 3. Broadcast via a Bitcoin node or API
+
+  // For now, we'll simulate this
+  console.warn('⚠️  Bitcoin transaction sending not fully implemented - would send:', {
+    from: btcAddress,
+    to: toAddress,
+    amount: amountSats
+  });
+
+  // Return a dummy txid for now
+  return 'btc_dummy_txid_' + Date.now();
+}
+
+// Send Solana transaction
+async function sendSolanaTransaction(toAddress, amountLamports) {
+  if (!solWallet || !solanaConnection) {
+    throw new Error('Solana wallet not initialized');
+  }
+
+  console.log(`📤 Sending ${amountLamports / LAMPORTS_PER_SOL} SOL to ${toAddress}`);
+
+  try {
+    const transaction = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: solWallet.publicKey,
+        toPubkey: new PublicKey(toAddress),
+        lamports: amountLamports,
+      })
+    );
+
+    const signature = await sendAndConfirmTransaction(
+      solanaConnection,
+      transaction,
+      [solWallet],
+      { commitment: 'confirmed' }
+    );
+
+    console.log('✅ Solana transaction confirmed:', signature);
+    return signature;
+  } catch (error) {
+    console.error('❌ Solana transaction failed:', error.message);
+    throw error;
+  }
+}
 
 // Initialize connection to ICP canister
 async function initializeAgent() {
   try {
-    // Create or load a dedicated resolver identity so the resolver does NOT reuse
-    // the same identity as frontend users. For demo/dev we generate an identity
-    // if none is provided. In production, provide a stable private key/identity.
-    let resolverIdentity;
-
-    // If you want to supply a deterministic identity, set RESOLVER_IDENTITY_SEED_BASE64
-    // to a base64-encoded 32-byte seed. Otherwise we'll generate a new identity.
-    if (process.env.RESOLVER_IDENTITY_SEED_BASE64) {
-      try {
-        const seed = Buffer.from(process.env.RESOLVER_IDENTITY_SEED_BASE64, 'base64');
-        if (seed.length !== 32) {
-          throw new Error('Seed must be exactly 32 bytes');
-        }
-        resolverIdentity = Ed25519KeyIdentity.generate(seed);
-        console.log('🔐 Loaded resolver identity from RESOLVER_IDENTITY_SEED_BASE64');
-      } catch (err) {
-        console.warn('⚠️  Failed to parse RESOLVER_IDENTITY_SEED_BASE64, falling back to generated identity', err);
-        resolverIdentity = Ed25519KeyIdentity.generate();
-      }
-    } else {
-      resolverIdentity = Ed25519KeyIdentity.generate();
-      console.log('🔐 Generated ephemeral resolver identity (set RESOLVER_IDENTITY_SEED_BASE64 to persist it)');
-    }
-
+    // Use anonymous agent (no identity needed)
     agent = new HttpAgent({
       host: IC_HOST,
-      identity: resolverIdentity,
     });
 
-    // Fetch root key for local development (remove in production)
+    // Fetch root key for local development
     if (IC_HOST.includes('localhost') || IC_HOST.includes('127.0.0.1')) {
       await agent.fetchRootKey();
     }
@@ -77,14 +289,6 @@ async function initializeAgent() {
       canisterId: CANISTER_ID,
     });
 
-    // Print resolver principal so it's easy to identify the resolver account
-    try {
-      const principal = resolverIdentity.getPrincipal().toText();
-      console.log('🔎 Resolver principal:', principal);
-    } catch (e) {
-      console.warn('Could not get resolver principal:', e);
-    }
-
     console.log('✅ Connected to ICP canister:', CANISTER_ID);
     return true;
   } catch (error) {
@@ -93,43 +297,27 @@ async function initializeAgent() {
   }
 }
 
-// Check if an order is profitable
-function isOrderProfitable(order) {
+// Check if resolver has sufficient balance
+async function hasSufficientBalance(order) {
   try {
-    const fromChain = Object.keys(order.from_chain)[0];
     const toChain = Object.keys(order.to_chain)[0];
-    const fromAmount = Number(order.from_amount);
     const toAmount = Number(order.to_amount);
 
-    let expectedAmount;
-
-    if (fromChain === 'Bitcoin' && toChain === 'Solana') {
-      // User is swapping BTC to SOL
-      // Resolver needs to provide SOL and receives BTC
-      const btcValue = fromAmount / 100000000; // Convert satoshis to BTC
-      expectedAmount = btcValue * RESOLVER_CONFIG.btcToSolRate * 1000000000; // Convert to lamports
-      const profitMargin = ((expectedAmount - toAmount) / expectedAmount) * 100;
-
-      console.log(`BTC->SOL: User offers ${btcValue} BTC, wants ${toAmount / 1000000000} SOL`);
-      console.log(`Fair value: ${expectedAmount / 1000000000} SOL, Profit margin: ${profitMargin.toFixed(2)}%`);
-
-      return profitMargin >= RESOLVER_CONFIG.minProfitMargin && toAmount <= RESOLVER_CONFIG.maxSolAmount;
-    } else if (fromChain === 'Solana' && toChain === 'Bitcoin') {
-      // User is swapping SOL to BTC
-      // Resolver needs to provide BTC and receives SOL
-      const solValue = fromAmount / 1000000000; // Convert lamports to SOL
-      expectedAmount = solValue * RESOLVER_CONFIG.solToBtcRate * 100000000; // Convert to satoshis
-      const profitMargin = ((expectedAmount - toAmount) / expectedAmount) * 100;
-
-      console.log(`SOL->BTC: User offers ${solValue} SOL, wants ${toAmount / 100000000} BTC`);
-      console.log(`Fair value: ${expectedAmount / 100000000} BTC, Profit margin: ${profitMargin.toFixed(2)}%`);
-
-      return profitMargin >= RESOLVER_CONFIG.minProfitMargin && toAmount <= RESOLVER_CONFIG.maxBtcAmount;
+    if (toChain === 'Bitcoin') {
+      const btcBalance = await getBitcoinBalance();
+      const hasFunds = btcBalance >= toAmount;
+      console.log(`   BTC Balance: ${btcBalance / 100000000} BTC, Required: ${toAmount / 100000000} BTC`);
+      return hasFunds;
+    } else if (toChain === 'Solana') {
+      const solBalance = await getSolanaBalance();
+      const hasFunds = solBalance >= toAmount;
+      console.log(`   SOL Balance: ${solBalance / LAMPORTS_PER_SOL} SOL, Required: ${toAmount / LAMPORTS_PER_SOL} SOL`);
+      return hasFunds;
     }
 
     return false;
   } catch (error) {
-    console.error('Error checking profitability:', error);
+    console.error('Error checking balance:', error);
     return false;
   }
 }
@@ -142,52 +330,131 @@ async function processOrder(order) {
     return; // Already processed
   }
 
+  const fromChain = Object.keys(order.from_chain)[0];
+  const toChain = Object.keys(order.to_chain)[0];
+  const fromAmount = Number(order.from_amount);
+  const toAmount = Number(order.to_amount);
+
   console.log(`\n📋 New order detected: #${orderId}`);
-  console.log(`From: ${Object.keys(order.from_chain)[0]} (${order.from_amount})`);
-  console.log(`To: ${Object.keys(order.to_chain)[0]} (${order.to_amount})`);
+  console.log(`   From: ${fromChain} (${fromChain === 'Bitcoin' ? (fromAmount / 100000000).toFixed(8) : (fromAmount / LAMPORTS_PER_SOL).toFixed(4)} ${fromChain === 'Bitcoin' ? 'BTC' : 'SOL'})`);
+  console.log(`   To: ${toChain} (${toChain === 'Bitcoin' ? (toAmount / 100000000).toFixed(8) : (toAmount / LAMPORTS_PER_SOL).toFixed(4)} ${toChain === 'Bitcoin' ? 'BTC' : 'SOL'})`);
+  console.log(`   Creator deposited: ${order.creator_deposited}`);
+  console.log(`   Resolver deposited: ${order.resolver_deposited}`);
 
-  // Check if order is profitable
-  /*   if (!isOrderProfitable(order)) {
-      console.log(`⚠️  Order #${orderId} not profitable, skipping`);
-      processedOrders.add(orderId);
-      return;
-    } */
+  // Check if we have the required wallet
+  if (toChain === 'Bitcoin' && !btcWallet) {
+    console.log(`⚠️  Bitcoin wallet not configured, skipping order #${orderId}`);
+    processedOrders.add(orderId);
+    return;
+  }
 
-  console.log(`✅ Order #${orderId} is profitable, attempting to accept...`);
+  if (toChain === 'Solana' && !solWallet) {
+    console.log(`⚠️  Solana wallet not configured, skipping order #${orderId}`);
+    processedOrders.add(orderId);
+    return;
+  }
+
+  // Check if we have sufficient balance
+  const hasBalance = await hasSufficientBalance(order);
+  if (!hasBalance) {
+    console.log(`⚠️  Insufficient balance for order #${orderId}, skipping`);
+    processedOrders.add(orderId);
+    return;
+  }
+
+  console.log(`✅ Order #${orderId} can be fulfilled, attempting to accept...`);
 
   try {
-    // First, ensure resolver has enough balance in canister
-    const toChain = Object.keys(order.to_chain)[0];
-    const chainVariant = toChain === 'Bitcoin' ? { Bitcoin: null } : { Solana: null };
+    // Accept the order with resolver's wallet addresses
+    const resolverBtcAddr = btcAddress ? [btcAddress] : [];
+    const resolverSolAddr = solAddress ? [solAddress] : [];
 
-    const balance = await actor.get_balance(chainVariant);
-    console.log(`Resolver balance for ${toChain}: ${balance}`);
-
-    if (BigInt(balance) < BigInt(order.to_amount)) {
-      console.log(`⚠️  Insufficient balance, depositing funds...`);
-      // In production, this would trigger actual BTC/SOL deposit
-      // For now, we'll just deposit the required amount
-      const depositResult = await actor.deposit_funds(chainVariant, order.to_amount);
-      console.log(`Deposit result:`, depositResult);
-    }
-
-    // Accept the order
-    const result = await actor.accept_order(BigInt(orderId));
+    const result = await actor.accept_order(BigInt(orderId), resolverBtcAddr, resolverSolAddr);
 
     if ('Ok' in result) {
-      console.log(`✅ Successfully accepted order #${orderId}: ${result.Ok}`);
-      processedOrders.add(orderId);
+      const canisterAddresses = result.Ok;
+      console.log(`✅ Order #${orderId} accepted!`);
+      console.log(`   Canister BTC address: ${canisterAddresses.bitcoin_address}`);
+      console.log(`   Canister SOL address: ${canisterAddresses.solana_address}`);
 
-      // In a real implementation, you would:
-      // 1. Monitor the blockchain for the actual fund transfers
-      // 2. Verify the funds are locked properly
-      // 3. Wait for the secret to be revealed
-      // 4. Execute the cross-chain transfers
+      // Send the required funds to canister
+      let txid;
+      if (toChain === 'Bitcoin') {
+        console.log(`📤 Sending ${toAmount / 100000000} BTC to canister...`);
+        txid = await sendBitcoinTransaction(canisterAddresses.bitcoin_address, toAmount);
+      } else {
+        console.log(`📤 Sending ${toAmount / LAMPORTS_PER_SOL} SOL to canister...`);
+        txid = await sendSolanaTransaction(canisterAddresses.solana_address, toAmount);
+      }
+
+      console.log(`   Transaction ID: ${txid}`);
+
+      // Confirm the resolver deposit with the canister
+      console.log(`📝 Confirming resolver deposit for order #${orderId}...`);
+      const confirmResult = await actor.confirm_resolver_deposit(BigInt(orderId), txid);
+
+      if ('Ok' in confirmResult) {
+        console.log(`✅ Resolver deposit confirmed for order #${orderId}`);
+        console.log(`   Message: ${confirmResult.Ok}`);
+        processedOrders.add(orderId);
+        acceptedOrders.set(orderId, {
+          acceptedAt: Date.now(),
+          lastStatus: 'ResolverDeposited',
+          toChain,
+          toAmount
+        });
+        console.log(`   👁️  Now monitoring order #${orderId} for completion...`);
+      } else {
+        console.error(`❌ Failed to confirm resolver deposit: ${confirmResult.Err}`);
+      }
+
     } else {
       console.error(`❌ Failed to accept order #${orderId}: ${result.Err}`);
     }
   } catch (error) {
-    console.error(`❌ Error processing order #${orderId}:`, error);
+    console.error(`❌ Error processing order #${orderId}:`, error.message);
+  }
+}
+
+// Monitor accepted orders for status changes
+async function monitorAcceptedOrders() {
+  if (acceptedOrders.size === 0) {
+    return;
+  }
+
+  try {
+    for (const [orderId, orderInfo] of acceptedOrders.entries()) {
+      const result = await actor.get_order(BigInt(orderId));
+
+      if (result.length > 0) {
+        const order = result[0];
+        const currentStatus = Object.keys(order.status)[0];
+
+        if (currentStatus !== orderInfo.lastStatus) {
+          console.log(`\n🔔 Order #${orderId} status changed: ${orderInfo.lastStatus} → ${currentStatus}`);
+
+          if (currentStatus === 'Completed') {
+            const { toChain, toAmount } = orderInfo;
+            console.log(`✅ Order #${orderId} completed!`);
+            console.log(`   Resolver should have received: ${toChain === 'Bitcoin' ? (toAmount / 100000000).toFixed(8) : (toAmount / LAMPORTS_PER_SOL).toFixed(4)} ${toChain === 'Bitcoin' ? 'BTC' : 'SOL'}`);
+            console.log(`   Check your ${toChain} wallet for funds.`);
+            acceptedOrders.delete(orderId); // Stop monitoring
+          } else if (currentStatus === 'Cancelled' || currentStatus === 'Expired') {
+            console.log(`⚠️  Order #${orderId} ${currentStatus.toLowerCase()}`);
+            console.log(`   Funds should be refunded automatically by the canister.`);
+            acceptedOrders.delete(orderId); // Stop monitoring
+          } else {
+            // Update status
+            orderInfo.lastStatus = currentStatus;
+          }
+        }
+      } else {
+        console.log(`⚠️  Order #${orderId} not found, removing from monitoring`);
+        acceptedOrders.delete(orderId);
+      }
+    }
+  } catch (error) {
+    console.error('Error monitoring accepted orders:', error);
   }
 }
 
@@ -206,9 +473,16 @@ async function pollForOrders() {
       console.log(`\n🔍 Found ${pendingOrders.length} pending order(s)`);
 
       for (const order of pendingOrders) {
-        await processOrder(order);
+        // Only process orders that have received creator deposit
+        const status = Object.keys(order.status)[0];
+        if (status === 'DepositReceived') {
+          await processOrder(order);
+        }
       }
     }
+
+    // Also monitor orders we've already accepted
+    await monitorAcceptedOrders();
   } catch (error) {
     console.error('Error polling for orders:', error);
   } finally {
@@ -218,13 +492,56 @@ async function pollForOrders() {
 
 // API endpoints
 
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  const btcBalance = btcAddress ? await getBitcoinBalance() : 0;
+  const solBalance = solAddress ? await getSolanaBalance() : 0;
+
   res.json({
     status: 'healthy',
     canisterId: CANISTER_ID,
     host: IC_HOST,
-    processedOrders: processedOrders.size
+    processedOrders: processedOrders.size,
+    acceptedOrders: acceptedOrders.size,
+    monitoringOrders: Array.from(acceptedOrders.entries()).map(([id, info]) => ({
+      orderId: id,
+      status: info.lastStatus,
+      acceptedAt: new Date(info.acceptedAt).toISOString()
+    })),
+    wallets: {
+      bitcoin: {
+        configured: !!btcAddress,
+        address: btcAddress,
+        balance: btcBalance / 100000000 + ' BTC'
+      },
+      solana: {
+        configured: !!solAddress,
+        address: solAddress,
+        balance: solBalance / LAMPORTS_PER_SOL + ' SOL'
+      }
+    }
   });
+});
+
+app.get('/balances', async (req, res) => {
+  try {
+    const btcBalance = btcAddress ? await getBitcoinBalance() : 0;
+    const solBalance = solAddress ? await getSolanaBalance() : 0;
+
+    res.json({
+      bitcoin: {
+        address: btcAddress,
+        balanceSats: btcBalance,
+        balanceBTC: btcBalance / 100000000
+      },
+      solana: {
+        address: solAddress,
+        balanceLamports: solBalance,
+        balanceSOL: solBalance / LAMPORTS_PER_SOL
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.get('/config', (req, res) => {
@@ -232,16 +549,10 @@ app.get('/config', (req, res) => {
 });
 
 app.post('/config', (req, res) => {
-  const { minProfitMargin, btcToSolRate, solToBtcRate } = req.body;
+  const { minProfitMargin } = req.body;
 
   if (minProfitMargin !== undefined) {
     RESOLVER_CONFIG.minProfitMargin = parseFloat(minProfitMargin);
-  }
-  if (btcToSolRate !== undefined) {
-    RESOLVER_CONFIG.btcToSolRate = parseFloat(btcToSolRate);
-  }
-  if (solToBtcRate !== undefined) {
-    RESOLVER_CONFIG.solToBtcRate = parseFloat(solToBtcRate);
   }
 
   res.json({ message: 'Config updated', config: RESOLVER_CONFIG });
@@ -266,15 +577,16 @@ app.get('/orders/processed', (req, res) => {
 // Manual order acceptance
 app.post('/orders/:orderId/accept', async (req, res) => {
   try {
-    const orderId = BigInt(req.params.orderId);
-    const result = await actor.accept_order(orderId);
+    const orderId = req.params.orderId;
+    const orders = await actor.get_pending_orders();
+    const order = orders.find(o => Number(o.id) === Number(orderId));
 
-    if ('Ok' in result) {
-      processedOrders.add(Number(orderId));
-      res.json({ success: true, message: result.Ok });
-    } else {
-      res.status(400).json({ success: false, error: result.Err });
+    if (!order) {
+      return res.status(404).json({ success: false, error: 'Order not found' });
     }
+
+    await processOrder(order);
+    res.json({ success: true, message: `Processing order #${orderId}` });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -285,24 +597,60 @@ const PORT = process.env.PORT || 3001;
 
 async function start() {
   console.log('🚀 Starting IntentSwaps Resolver...\n');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
-  const initialized = await initializeAgent();
+  // Initialize wallets
+  console.log('🔑 Initializing wallets...');
+  const btcInitialized = initializeBitcoinWallet();
+  const solInitialized = initializeSolanaWallet();
 
-  if (!initialized) {
-    console.error('Failed to initialize, exiting...');
+  if (!btcInitialized && !solInitialized) {
+    console.error('\n❌ No wallets configured!');
+    console.error('   Please set BTC_PRIVATE_KEY and/or SOL_PRIVATE_KEY in your .env file\n');
     process.exit(1);
   }
 
+  console.log('');
+
+  // Initialize ICP agent
+  console.log('🔌 Connecting to ICP canister...');
+  const initialized = await initializeAgent();
+
+  if (!initialized) {
+    console.error('Failed to initialize ICP agent, exiting...');
+    process.exit(1);
+  }
+
+  console.log('');
+
+  // Show initial balances
+  if (btcAddress) {
+    const btcBalance = await getBitcoinBalance();
+    console.log(`💰 Initial BTC balance: ${(btcBalance / 100000000).toFixed(8)} BTC`);
+  }
+  if (solAddress) {
+    const solBalance = await getSolanaBalance();
+    console.log(`💰 Initial SOL balance: ${(solBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+  }
+
+  console.log('');
+
   // Start polling for orders
-  console.log(`⏱️  Starting order polling (every ${POLL_INTERVAL}ms)...\n`);
+  console.log(`⏱️  Starting order polling (every ${POLL_INTERVAL / 1000}s)...`);
   setInterval(pollForOrders, POLL_INTERVAL);
+
+  // Do an immediate poll
+  setTimeout(pollForOrders, 1000);
 
   // Start HTTP server
   app.listen(PORT, () => {
-    console.log(`\n🌐 Resolver API listening on port ${PORT}`);
-    console.log(`   Health check: http://localhost:${PORT}/health`);
-    console.log(`   Pending orders: http://localhost:${PORT}/orders/pending`);
-    console.log(`   Config: http://localhost:${PORT}/config\n`);
+    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`\n🌐 Resolver API running on port ${PORT}`);
+    console.log(`\n   📊 Health:        http://localhost:${PORT}/health`);
+    console.log(`   💰 Balances:      http://localhost:${PORT}/balances`);
+    console.log(`   📋 Orders:        http://localhost:${PORT}/orders/pending`);
+    console.log(`   ⚙️  Config:        http://localhost:${PORT}/config`);
+    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
   });
 }
 

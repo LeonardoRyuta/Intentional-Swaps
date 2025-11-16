@@ -1,0 +1,10 @@
+# Cargo configuration for SOL RPC canister compilation
+# 
+# Note: On macOS, you need to install LLVM via Homebrew and set the paths:
+#   brew install llvm
+#   LLVM_PATH=$(brew --prefix llvm)
+# Then uncomment and update the paths below:
+
+# [env]
+# AR="/opt/homebrew/opt/llvm/bin/llvm-ar"  # Update with your LLVM path
+# CC="/opt/homebrew/opt/llvm/bin/clang"    # Update with your LLVM path

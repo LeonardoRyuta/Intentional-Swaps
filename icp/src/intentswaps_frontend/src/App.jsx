@@ -1,7 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Actor } from '@icp-sdk/core/agent';
-import { HttpAgent } from '@icp-sdk/core/agent';
-import { AuthClient } from '@dfinity/auth-client';
+import { Actor, HttpAgent } from '@dfinity/agent';
 import { idlFactory, canisterId } from 'declarations/intentswaps_backend';
 import md5 from 'md5';
 import './App.css';
@@ -12,14 +10,19 @@ function App() {
   const [view, setView] = useState('swap'); // 'swap', 'orders', 'my-orders'
   const [orders, setOrders] = useState([]);
   const [myOrders, setMyOrders] = useState([]);
-  const [balances, setBalances] = useState({ btc: 0n, sol: 0n });
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
-  const [connected, setConnected] = useState(false);
-  const [principalText, setPrincipalText] = useState('');
   const [actor, setActor] = useState(null);
-  const [authClient, setAuthClient] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
+
+  // Wallet states
+  const [phantomWallet, setPhantomWallet] = useState(null);
+  const [phantomAddress, setPhantomAddress] = useState('');
+  const [phantomBalance, setPhantomBalance] = useState(0);
+  const [unisatWallet, setUnisatWallet] = useState(null);
+  const [unisatAddress, setUnisatAddress] = useState('');
+  const [unisatBalance, setUnisatBalance] = useState(0);
+  const [walletConnecting, setWalletConnecting] = useState(false);
 
   // Form states
   const [fromChain, setFromChain] = useState('Bitcoin');
@@ -35,31 +38,55 @@ function App() {
   const [loadingRate, setLoadingRate] = useState(false);
   const [rateError, setRateError] = useState('');
 
-  const identityProviderUrl = network === 'ic'
-    ? 'https://identity.ic0.app' // Mainnet
-    : `http://rdmx6-jaaaa-aaaaa-aaadq-cai.localhost:4943`; // Local
-
   const agentHost = network === 'ic'
     ? 'https://icp-api.io' // Mainnet
     : 'http://127.0.0.1:4943'; // Local replica
 
-  // Initialize actor on mount with anonymous identity
+  // Initialize anonymous actor on mount
   useEffect(() => {
     initializeActor();
+    checkWalletAvailability();
   }, []);
+
+  // Check if wallets are available
+  const checkWalletAvailability = () => {
+    // Check for Phantom
+    if (window.solana?.isPhantom) {
+      console.log('Phantom wallet detected');
+    }
+    // Check for Unisat
+    if (window.unisat) {
+      console.log('Unisat wallet detected');
+    }
+  };
 
   // Poll for orders when actor is available
   useEffect(() => {
     if (!actor) return;
 
     loadOrders();
-    loadBalances();
     const interval = setInterval(() => {
       loadOrders();
-      loadBalances();
     }, 5000);
     return () => clearInterval(interval);
   }, [actor]);
+
+  // Poll wallet balances when wallets are connected
+  useEffect(() => {
+    if (phantomWallet && phantomAddress) {
+      loadPhantomBalance();
+      const interval = setInterval(loadPhantomBalance, 10000); // Every 10 seconds
+      return () => clearInterval(interval);
+    }
+  }, [phantomWallet, phantomAddress]);
+
+  useEffect(() => {
+    if (unisatWallet && unisatAddress) {
+      loadUnisatBalance();
+      const interval = setInterval(loadUnisatBalance, 30000); // Every 30 seconds
+      return () => clearInterval(interval);
+    }
+  }, [unisatWallet, unisatAddress]);
 
   // Fetch exchange rate on mount and periodically
   useEffect(() => {
@@ -70,7 +97,8 @@ function App() {
 
   const initializeActor = async () => {
     try {
-      const agent = await HttpAgent.create({
+      // Create anonymous agent (no identity needed)
+      const agent = new HttpAgent({
         host: agentHost,
       });
 
@@ -85,96 +113,212 @@ function App() {
       });
 
       setActor(backendActor);
+      console.log('Anonymous actor initialized');
     } catch (error) {
       console.error('Error initializing actor:', error);
       showMessage('Failed to connect to canister', true);
     }
   };
 
-  const connect = async () => {
-    try {
-      const ac = await AuthClient.create();
-      setAuthClient(ac);
-
-      await ac.login({
-        identityProvider: identityProviderUrl,
-        onSuccess: async () => {
-          const identity = ac.getIdentity();
-          /*           const agent = await HttpAgent.create({
-                      host: agentHost,
-                      identity,
-                    }); */
-          const agent = new HttpAgent({
-            identity,
-          })
-
-          // Fetch root key for local development
-          if (network !== 'ic') {
-            await agent.fetchRootKey().catch(() => { });
-          }
-
-          const authenticatedActor = Actor.createActor(idlFactory, {
-            agent,
-            canisterId,
-          });
-
-          setActor(authenticatedActor);
-          setConnected(true);
-
-          try {
-            setPrincipalText(identity.getPrincipal().toText());
-          } catch (e) {
-            console.error('Error getting principal:', e);
-          }
-
-          showMessage('Connected successfully!');
-        },
-        onError: (error) => {
-          console.error('Login error:', error);
-          showMessage('Failed to connect: ' + error, true);
-        },
-      });
-    } catch (err) {
-      console.error('Error connecting auth client', err);
-      showMessage('Failed to connect wallet: ' + (err.message || err), true);
+  // Connect Phantom Wallet
+  const connectPhantom = async () => {
+    if (!window.solana?.isPhantom) {
+      showMessage('Phantom wallet not found! Please install it from phantom.app', true);
+      window.open('https://phantom.app/', '_blank');
+      return;
     }
+
+    setWalletConnecting(true);
+    try {
+      console.log('Connecting to Phantom...');
+      const response = await window.phantom.solana.connect();
+      console.log('Phantom connected:', response);
+      const address = response.publicKey.toString();
+      setPhantomWallet(window.phantom.solana);
+      setPhantomAddress(address);
+      showMessage(`Phantom connected: ${address.substring(0, 8)}...`);
+
+      // Load balance immediately after connecting
+      setTimeout(async () => {
+        try {
+          const { Connection, PublicKey, LAMPORTS_PER_SOL } = await import('@solana/web3.js');
+          const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+          const publicKey = new PublicKey(address);
+          const balance = await connection.getBalance(publicKey);
+          const solBalance = balance / LAMPORTS_PER_SOL;
+          setPhantomBalance(solBalance);
+        } catch (error) {
+          console.error('Error loading initial Phantom balance:', error);
+        }
+      }, 500);
+
+      // Listen for account changes
+      window.phantom.solana.on('accountChanged', (publicKey) => {
+        if (publicKey) {
+          const newAddress = publicKey.toString();
+          setPhantomAddress(newAddress);
+          setPhantomBalance(0); // Reset balance until loaded
+          showMessage(`Phantom account changed to: ${newAddress.substring(0, 8)}...`);
+        } else {
+          setPhantomWallet(null);
+          setPhantomAddress('');
+          setPhantomBalance(0);
+          showMessage('Phantom disconnected');
+        }
+      });
+    } catch (error) {
+      console.error('Phantom connection error:', error);
+      showMessage('Failed to connect Phantom wallet: ' + error.message, true);
+    }
+    setWalletConnecting(false);
   };
 
-  const disconnect = async () => {
-    try {
-      if (authClient) await authClient.logout();
-    } catch (e) {
-      console.error('Error during logout:', e);
+  // Disconnect Phantom
+  const disconnectPhantom = async () => {
+    if (phantomWallet) {
+      try {
+        await phantomWallet.disconnect();
+      } catch (error) {
+        console.error('Error disconnecting Phantom:', error);
+      }
+    }
+    setPhantomWallet(null);
+    setPhantomAddress('');
+    setPhantomBalance(0);
+    showMessage('Phantom disconnected');
+  };
+
+  // Connect Unisat Wallet
+  const connectUnisat = async () => {
+    if (!window.unisat) {
+      showMessage('Unisat wallet not found! Please install it from unisat.io', true);
+      window.open('https://unisat.io/', '_blank');
+      return;
     }
 
-    // Re-initialize with anonymous identity
-    await initializeActor();
-    setConnected(false);
-    setPrincipalText('');
-    setAuthClient(null);
-    showMessage('Disconnected');
+    setWalletConnecting(true);
+    try {
+      // Request accounts
+      const accounts = await window.unisat.requestAccounts();
+      if (accounts.length > 0) {
+        const address = accounts[0];
+        setUnisatWallet(window.unisat);
+        setUnisatAddress(address);
+
+        // Switch to testnet
+        try {
+          await window.unisat.switchNetwork('testnet');
+          showMessage(`Unisat connected (Testnet): ${address.substring(0, 8)}...`);
+        } catch (switchError) {
+          console.warn('Could not switch to testnet:', switchError);
+          showMessage(`Unisat connected: ${address.substring(0, 8)}... (Please ensure you're on Testnet)`, true);
+        }
+
+        // Load balance immediately after connecting
+        setTimeout(async () => {
+          try {
+            const balance = await window.unisat.getBalance();
+            const btcBalance = balance.total / 100000000;
+            setUnisatBalance(btcBalance);
+          } catch (error) {
+            console.error('Error loading initial Unisat balance:', error);
+          }
+        }, 500);
+
+        // Listen for account changes
+        window.unisat.on('accountsChanged', (accounts) => {
+          if (accounts.length > 0) {
+            const newAddress = accounts[0];
+            setUnisatAddress(newAddress);
+            setUnisatBalance(0); // Reset balance until loaded
+            showMessage(`Unisat account changed to: ${newAddress.substring(0, 8)}...`);
+          } else {
+            setUnisatWallet(null);
+            setUnisatAddress('');
+            setUnisatBalance(0);
+            showMessage('Unisat disconnected');
+          }
+        });
+      }
+    } catch (error) {
+      console.error('Unisat connection error:', error);
+      showMessage('Failed to connect Unisat wallet: ' + error.message, true);
+    }
+    setWalletConnecting(false);
+  };
+
+  // Disconnect Unisat
+  const disconnectUnisat = () => {
+    setUnisatWallet(null);
+    setUnisatAddress('');
+    setUnisatBalance(0);
+    showMessage('Unisat disconnected');
   };
 
   const loadOrders = async () => {
     if (!actor) return;
     try {
-      const pending = await actor.get_pending_orders();
-      const mine = await actor.get_my_orders();
-      setOrders(pending);
-      setMyOrders(mine);
+      const allPending = await actor.get_pending_orders();
+
+      // "Orders" view shows ALL pending orders (for resolvers to see available swaps)
+      setOrders(allPending);
+
+      // "My Orders" view shows only orders created BY or accepted BY the current user's wallets
+      if (unisatAddress || phantomAddress) {
+        const myFilteredOrders = allPending.filter(order => {
+          // Check if this order was created by current wallet addresses
+          const creatorBtcAddr = order.creator_btc_address;
+          const creatorSolAddr = order.creator_sol_address;
+
+          // Check if this order was accepted by current wallet addresses (resolver)
+          const resolverBtcAddr = order.resolver_btc_address;
+          const resolverSolAddr = order.resolver_sol_address;
+
+          const isCreator = (unisatAddress && creatorBtcAddr === unisatAddress) ||
+            (phantomAddress && creatorSolAddr === phantomAddress);
+
+          const isResolver = (unisatAddress && resolverBtcAddr === unisatAddress) ||
+            (phantomAddress && resolverSolAddr === phantomAddress);
+
+          return isCreator || isResolver;
+        });
+        setMyOrders(myFilteredOrders);
+      } else {
+        setMyOrders([]);
+      }
     } catch (error) {
       console.error('Error loading orders:', error);
     }
   };
 
-  const loadBalances = async () => {
-    if (!actor) return;
+  // Load Phantom (Solana) wallet balance
+  const loadPhantomBalance = async () => {
+    if (!phantomWallet || !phantomAddress) return;
+
     try {
-      const btc = await actor.get_balance({ Bitcoin: null });
-      const sol = await actor.get_balance({ Solana: null });
-      setBalances({ btc, sol });
+      const { Connection, PublicKey, LAMPORTS_PER_SOL } = await import('@solana/web3.js');
+      const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+      const publicKey = new PublicKey(phantomAddress);
+      const balance = await connection.getBalance(publicKey);
+      const solBalance = balance / LAMPORTS_PER_SOL;
+      setPhantomBalance(solBalance);
+      console.log(`Phantom balance: ${solBalance} SOL`);
     } catch (error) {
-      console.error('Error loading balances:', error);
+      console.error('Error loading Phantom balance:', error);
+    }
+  };
+
+  // Load Unisat (Bitcoin) wallet balance
+  const loadUnisatBalance = async () => {
+    if (!unisatWallet || !unisatAddress) return;
+
+    try {
+      const balance = await unisatWallet.getBalance();
+      const btcBalance = balance.total / 100000000; // Convert satoshis to BTC
+      setUnisatBalance(btcBalance);
+      console.log(`Unisat balance: ${btcBalance} BTC`);
+    } catch (error) {
+      console.error('Error loading Unisat balance:', error);
     }
   };
 
@@ -330,28 +474,30 @@ function App() {
     setTimeout(() => setMessage(''), 5000);
   };
 
-  const handleDeposit = async (chain, amount) => {
-    if (!actor) return;
-    setLoading(true);
-    try {
-      const chainVariant = chain === 'Bitcoin' ? { Bitcoin: null } : { Solana: null };
-      const result = await actor.deposit_funds(chainVariant, BigInt(amount));
 
-      if ('Ok' in result) {
-        showMessage(result.Ok);
-        await loadBalances();
-      } else {
-        showMessage(result.Err, true);
-      }
-    } catch (error) {
-      showMessage('Error depositing funds: ' + error.message, true);
-    }
-    setLoading(false);
-  };
 
   const handleCreateOrder = async (e) => {
     e.preventDefault();
     if (!actor) return;
+
+    // Validate wallet connections
+    if (fromChain === 'Bitcoin' && !unisatAddress) {
+      showMessage('Please connect your Unisat wallet first', true);
+      return;
+    }
+    if (fromChain === 'Solana' && !phantomAddress) {
+      showMessage('Please connect your Phantom wallet first', true);
+      return;
+    }
+    if (toChain === 'Bitcoin' && !unisatAddress) {
+      showMessage('Please connect your Unisat wallet to receive BTC', true);
+      return;
+    }
+    if (toChain === 'Solana' && !phantomAddress) {
+      showMessage('Please connect your Phantom wallet to receive SOL', true);
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -373,20 +519,63 @@ function App() {
         timeout_seconds: BigInt(timeoutMinutes * 60),
       };
 
-      const result = await actor.create_order(request);
+      // Pass user's wallet addresses to backend
+      const creatorBtcAddr = unisatAddress ? [unisatAddress] : [];
+      const creatorSolAddr = phantomAddress ? [phantomAddress] : [];
+
+      showMessage('Creating order on canister...');
+      const result = await actor.create_order(request, creatorBtcAddr, creatorSolAddr);
 
       if ('Ok' in result) {
-        const orderId = result.Ok;
+        const [orderId, canisterAddresses] = result.Ok;
+
         // Store the secret for automatic reveal later
         storeSecret(orderId, secret);
-        showMessage(`Order created successfully! Order ID: ${orderId}. Secret will be auto-revealed when accepted.`);
-        await loadOrders();
-        await loadBalances();
-        // Reset form
-        setFromAmount('');
-        setToAmount('');
-        setSecret('');
-        setSecretHash('');
+
+        showMessage(`Order #${orderId} created! Now sending funds from your wallet...`);
+
+        // Now send the transaction from user's wallet
+        let txid;
+        try {
+          if (fromChain === 'Bitcoin') {
+            txid = await sendBitcoinTransaction(
+              canisterAddresses.bitcoin_address,
+              parseFloat(fromAmount)
+            );
+          } else {
+            txid = await sendSolanaTransaction(
+              canisterAddresses.solana_address,
+              parseFloat(fromAmount)
+            );
+          }
+
+          if (txid) {
+            showMessage(`Transaction sent! Confirming deposit... (txid: ${txid.substring(0, 10)}...)`);
+
+            // Confirm the deposit with the canister
+            const confirmResult = await actor.confirm_deposit(BigInt(orderId), txid);
+
+            if ('Ok' in confirmResult) {
+              showMessage(`✅ Order #${orderId} created and deposit confirmed! Waiting for resolver...`);
+              await loadOrders();
+              // Reload wallet balances
+              if (fromChain === 'Bitcoin') {
+                await loadUnisatBalance();
+              } else {
+                await loadPhantomBalance();
+              }
+              // Reset form
+              setFromAmount('');
+              setToAmount('');
+              setSecret('');
+              setSecretHash('');
+            } else {
+              showMessage(`Order created but deposit confirmation failed: ${confirmResult.Err}. Please confirm manually with txid: ${txid}`, true);
+            }
+          }
+        } catch (txError) {
+          showMessage(`Order #${orderId} created but transaction failed: ${txError.message}. Please send funds manually to: ${fromChain === 'Bitcoin' ? canisterAddresses.bitcoin_address : canisterAddresses.solana_address}`, true);
+        }
       } else {
         showMessage(result.Err, true);
       }
@@ -394,6 +583,84 @@ function App() {
       showMessage('Error creating order: ' + error.message, true);
     }
     setLoading(false);
+  };
+
+  // Send Bitcoin transaction via Unisat
+  const sendBitcoinTransaction = async (toAddress, amountBTC) => {
+    if (!unisatWallet) {
+      throw new Error('Unisat wallet not connected');
+    }
+
+    try {
+      // Convert BTC to satoshis
+      const amountSatoshis = Math.floor(amountBTC * 100000000);
+
+      showMessage('Please confirm the Bitcoin transaction in your Unisat wallet...');
+
+      // Send transaction using Unisat API
+      const txid = await unisatWallet.sendBitcoin(toAddress, amountSatoshis);
+
+      console.log('Bitcoin transaction sent:', txid);
+      return txid;
+    } catch (error) {
+      console.error('Bitcoin transaction error:', error);
+      if (error.message?.includes('User rejected')) {
+        throw new Error('Transaction cancelled by user');
+      }
+      throw new Error('Bitcoin transaction failed: ' + error.message);
+    }
+  };
+
+  // Send Solana transaction via Phantom
+  const sendSolanaTransaction = async (toAddress, amountSOL) => {
+    if (!phantomWallet) {
+      throw new Error('Phantom wallet not connected');
+    }
+
+    try {
+      // Import Solana web3 dynamically
+      const { Connection, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } = await import('@solana/web3.js');
+
+      // Connect to Solana devnet
+      const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+
+      // Convert SOL to lamports
+      const amountLamports = Math.floor(amountSOL * LAMPORTS_PER_SOL);
+
+      // Create transaction
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: phantomWallet.publicKey,
+          toPubkey: new PublicKey(toAddress),
+          lamports: amountLamports,
+        })
+      );
+
+      // Get recent blockhash
+      transaction.feePayer = phantomWallet.publicKey;
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+
+      showMessage('Please confirm the Solana transaction in your Phantom wallet...');
+
+      // Sign and send transaction via Phantom
+      const signed = await phantomWallet.signAndSendTransaction(transaction);
+      const txid = signed.signature;
+
+      console.log('Solana transaction sent:', txid);
+
+      // Wait for confirmation
+      showMessage('Waiting for Solana transaction confirmation...');
+      await connection.confirmTransaction(txid);
+
+      return txid;
+    } catch (error) {
+      console.error('Solana transaction error:', error);
+      if (error.message?.includes('User rejected')) {
+        throw new Error('Transaction cancelled by user');
+      }
+      throw new Error('Solana transaction failed: ' + error.message);
+    }
   };
 
   const handleRevealSecret = async (orderId) => {
@@ -500,26 +767,59 @@ function App() {
         </div>
 
         <div className="nav-right">
-          <div className="wallet-info">
-            <div className="balance-compact">
-              <span className="balance-label">BTC</span>
-              <span className="balance-value">{formatAmount(balances.btc, 'Bitcoin')}</span>
-            </div>
-            <div className="balance-compact">
-              <span className="balance-label">SOL</span>
-              <span className="balance-value">{formatAmount(balances.sol, 'Solana')}</span>
-            </div>
+          {/* External Wallets */}
+          <div className="external-wallets">
+            {/* Bitcoin Wallet */}
+            {unisatAddress ? (
+              <div className="wallet-connected bitcoin">
+                <div className="wallet-info-top">
+                  <span className="wallet-icon">₿</span>
+                  <span className="wallet-address-short">
+                    {unisatAddress.substring(0, 6)}...{unisatAddress.substring(unisatAddress.length - 4)}
+                  </span>
+                  <button className="btn-disconnect-small" onClick={disconnectUnisat} title="Disconnect Unisat">×</button>
+                </div>
+                <div className="wallet-balance-display">
+                  {unisatBalance.toFixed(8)} BTC
+                </div>
+              </div>
+            ) : (
+              <button
+                className="btn-connect-wallet bitcoin"
+                onClick={connectUnisat}
+                disabled={walletConnecting}
+                title="Connect Unisat (Bitcoin Testnet)"
+              >
+                ₿ Unisat
+              </button>
+            )}
+
+            {/* Solana Wallet */}
+            {phantomAddress ? (
+              <div className="wallet-connected solana">
+                <div className="wallet-info-top">
+                  <span className="wallet-icon">◎</span>
+                  <span className="wallet-address-short">
+                    {phantomAddress.substring(0, 6)}...{phantomAddress.substring(phantomAddress.length - 4)}
+                  </span>
+                  <button className="btn-disconnect-small" onClick={disconnectPhantom} title="Disconnect Phantom">×</button>
+                </div>
+                <div className="wallet-balance-display">
+                  {phantomBalance.toFixed(4)} SOL
+                </div>
+              </div>
+            ) : (
+              <button
+                className="btn-connect-wallet solana"
+                onClick={connectPhantom}
+                disabled={walletConnecting}
+                title="Connect Phantom (Solana Devnet)"
+              >
+                ◎ Phantom
+              </button>
+            )}
           </div>
-          {connected ? (
-            <div className="connected-wallet">
-              <span className="wallet-address">
-                {principalText ? principalText.substring(0, 6) + '...' + principalText.substring(principalText.length - 4) : 'Connected'}
-              </span>
-              <button className="btn-disconnect" onClick={disconnect}>Disconnect</button>
-            </div>
-          ) : (
-            <button className="btn-connect" onClick={connect}>Connect Wallet</button>
-          )}
+
         </div>
       </nav>
 
@@ -560,16 +860,49 @@ function App() {
                 </div>
               )}
 
+              {/* Wallet Connection Notice */}
+              {(!unisatAddress || !phantomAddress) && (
+                <div className="wallet-notice">
+                  <div className="notice-icon">🔐</div>
+                  <div className="notice-content">
+                    <h4>Connect Your Wallets</h4>
+                    <p>You need to connect both wallets to create swaps:</p>
+                    <div className="wallet-requirements">
+                      {!unisatAddress && (
+                        <div className="wallet-requirement">
+                          <span className="requirement-icon">₿</span>
+                          <span>Unisat wallet for Bitcoin (Testnet)</span>
+                          <button className="btn-connect-inline" onClick={connectUnisat}>
+                            Connect Unisat
+                          </button>
+                        </div>
+                      )}
+                      {!phantomAddress && (
+                        <div className="wallet-requirement">
+                          <span className="requirement-icon">◎</span>
+                          <span>Phantom wallet for Solana (Devnet)</span>
+                          <button className="btn-connect-inline" onClick={connectPhantom}>
+                            Connect Phantom
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                    <p className="notice-info">
+                      💡 Your wallet addresses are used to send deposits and receive swapped funds
+                    </p>
+                  </div>
+                </div>
+              )}
+
               <form onSubmit={handleCreateOrder}>
                 {/* From Token */}
                 <div className="token-input-container">
                   <div className="token-input-header">
                     <label>You pay</label>
                     <span className="balance-display">
-                      Balance: {formatAmount(
-                        fromChain === 'Bitcoin' ? balances.btc : balances.sol,
-                        fromChain
-                      )}
+                      Balance: {fromChain === 'Bitcoin'
+                        ? `${unisatBalance.toFixed(8)} BTC`
+                        : `${phantomBalance.toFixed(4)} SOL`}
                     </span>
                   </div>
                   <div className="token-input-row">
@@ -591,19 +924,6 @@ function App() {
                       <option value="Solana">◎ Solana</option>
                     </select>
                   </div>
-                  <button
-                    type="button"
-                    className="deposit-btn"
-                    onClick={() => {
-                      const amount = prompt(`Enter amount in ${fromChain === 'Bitcoin' ? 'BTC' : 'SOL'}:`);
-                      if (amount) {
-                        const multiplier = fromChain === 'Bitcoin' ? 100000000 : 1000000000;
-                        handleDeposit(fromChain, Math.floor(parseFloat(amount) * multiplier));
-                      }
-                    }}
-                  >
-                    + Deposit {fromChain === 'Bitcoin' ? 'BTC' : 'SOL'}
-                  </button>
                 </div>
 
                 {/* Swap Arrow with Exchange Rate */}
@@ -647,10 +967,9 @@ function App() {
                   <div className="token-input-header">
                     <label>You receive (estimated)</label>
                     <span className="balance-display">
-                      Balance: {formatAmount(
-                        toChain === 'Bitcoin' ? balances.btc : balances.sol,
-                        toChain
-                      )}
+                      Balance: {toChain === 'Bitcoin'
+                        ? `${unisatBalance.toFixed(8)} BTC`
+                        : `${phantomBalance.toFixed(4)} SOL`}
                     </span>
                   </div>
                   <div className="token-input-row">
@@ -705,11 +1024,19 @@ function App() {
                 {/* Submit Button */}
                 <button
                   type="submit"
-                  disabled={loading || !secretHash}
+                  disabled={loading || !secretHash || !unisatAddress || !phantomAddress}
                   className="btn-swap"
                 >
-                  {loading ? 'Creating Order...' : 'Create Swap Order'}
+                  {loading ? 'Processing...' :
+                    !unisatAddress || !phantomAddress ? 'Connect Both Wallets First' :
+                      !secretHash ? 'Generate Secret First' :
+                        'Create Swap & Send Deposit'}
                 </button>
+                {(unisatAddress && phantomAddress) && (
+                  <div className="swap-info-text">
+                    ✓ Transaction will be sent from your wallet automatically
+                  </div>
+                )}
               </form>
             </div>
 
@@ -717,23 +1044,32 @@ function App() {
             <div className="info-card">
               <h3>💡 How it works</h3>
               <ol>
+                <li>Connect both Unisat (Bitcoin) and Phantom (Solana) wallets</li>
                 <li>Generate a secret hash for your swap</li>
-                <li>Create a swap order with your desired amounts</li>
-                <li>A resolver will accept and fulfill your order</li>
-                <li>Secret is automatically revealed to complete the swap ✨</li>
+                <li>Create order - your wallet automatically sends the deposit</li>
+                <li>A resolver accepts and fulfills your order</li>
+                <li>Secret is auto-revealed and you receive funds in your wallet ✨</li>
               </ol>
               <div className="info-feature">
+                <span className="feature-badge">🔐 Non-Custodial</span>
+                <p>You maintain full control of your funds. Your wallet signs all transactions, and the canister verifies them on-chain.</p>
+              </div>
+              <div className="info-feature">
                 <span className="feature-badge">🤖 Automated</span>
-                <p>Your secret is securely stored and automatically revealed when the order is accepted. No manual intervention needed!</p>
+                <p>Deposits are sent automatically from your wallet. Secrets are revealed automatically. Just connect and swap!</p>
               </div>
               <div className="info-stats">
                 <div className="stat">
                   <span className="stat-label">Network</span>
-                  <span className="stat-value">Internet Computer</span>
+                  <span className="stat-value">BTC Testnet • SOL Devnet</span>
                 </div>
                 <div className="stat">
-                  <span className="stat-label">Total Orders</span>
-                  <span className="stat-value">{orders.length + myOrders.length}</span>
+                  <span className="stat-label">Active Orders</span>
+                  <span className="stat-value">{orders.length}</span>
+                </div>
+                <div className="stat">
+                  <span className="stat-label">Type</span>
+                  <span className="stat-value">Non-Custodial DEX</span>
                 </div>
               </div>
             </div>
@@ -800,8 +1136,18 @@ function App() {
                     </div>
 
                     <div className="order-meta">
-                      <span className="meta-label">Creator:</span>
-                      <code className="meta-value">{order.creator.toString().substring(0, 12)}...</code>
+                      {order.creator_btc_address?.[0] && (
+                        <div>
+                          <span className="meta-label">Creator BTC:</span>
+                          <code className="meta-value">{order.creator_btc_address[0].substring(0, 8)}...{order.creator_btc_address[0].substring(order.creator_btc_address[0].length - 4)}</code>
+                        </div>
+                      )}
+                      {order.creator_sol_address?.[0] && (
+                        <div>
+                          <span className="meta-label">Creator SOL:</span>
+                          <code className="meta-value">{order.creator_sol_address[0].substring(0, 8)}...{order.creator_sol_address[0].substring(order.creator_sol_address[0].length - 4)}</code>
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -869,10 +1215,20 @@ function App() {
                       </div>
                     </div>
 
-                    {order.resolver[0] && (
+                    {(order.resolver_btc_address?.[0] || order.resolver_sol_address?.[0]) && (
                       <div className="order-meta">
-                        <span className="meta-label">Resolver:</span>
-                        <code className="meta-value">{order.resolver[0].toString().substring(0, 12)}...</code>
+                        {order.resolver_btc_address?.[0] && (
+                          <div>
+                            <span className="meta-label">Resolver BTC:</span>
+                            <code className="meta-value">{order.resolver_btc_address[0].substring(0, 8)}...{order.resolver_btc_address[0].substring(order.resolver_btc_address[0].length - 4)}</code>
+                          </div>
+                        )}
+                        {order.resolver_sol_address?.[0] && (
+                          <div>
+                            <span className="meta-label">Resolver SOL:</span>
+                            <code className="meta-value">{order.resolver_sol_address[0].substring(0, 8)}...{order.resolver_sol_address[0].substring(order.resolver_sol_address[0].length - 4)}</code>
+                          </div>
+                        )}
                       </div>
                     )}
 

@@ -26,6 +26,30 @@
         }
       },
       "wasm": "https://github.com/dfinity/internet-identity/releases/latest/download/internet_identity_dev.wasm.gz"
+    },
+    "icp_ledger_canister": {
+      "type": "custom",
+      "candid": "https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-08-29/ledger.did",
+      "wasm": "https://github.com/dfinity/ic/releases/download/ledger-suite-icp-2025-08-29/ledger-canister_notify-method.wasm.gz",
+      "remote": {
+        "id": {
+          "ic": "ryjl3-tyaaa-aaaaa-aaaba-cai"
+        }
+      },
+      "specified_id": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "init_arg": "(variant { Init = record { minting_account = \"5a5174d6a09ed20643439acfd336e13b08ac8602ceed0f61356afa849007e215\"; initial_values = vec { record { \"0496fbb4341f33cabc23022d99666a20e9a2d8ae00e828510dc8c2505c76f8a4\"; record { e8s = 10_000_000_000 : nat64; }; }; }; send_whitelist = vec {}; transfer_fee = opt record { e8s = 10_000 : nat64; }; token_symbol = opt \"LICP\"; token_name = opt \"Local ICP\"; } })"
+    },
+    "sol_rpc": {
+      "type": "custom",
+      "candid": "https://github.com/dfinity/sol-rpc-canister/releases/latest/download/sol_rpc_canister.did",
+      "wasm": "https://github.com/dfinity/sol-rpc-canister/releases/latest/download/sol_rpc_canister.wasm.gz",
+      "remote": {
+        "id": {
+          "ic": "tghme-zyaaa-aaaar-qarca-cai"
+        }
+      },
+      "specified_id": "tghme-zyaaa-aaaar-qarca-cai",
+      "init_arg": "( record {} )"
     }
   },
   "defaults": {

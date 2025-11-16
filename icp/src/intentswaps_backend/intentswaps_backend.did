@@ -4,8 +4,9 @@ type Chain = variant {
 };
 
 type OrderStatus = variant {
-    Pending;
-    Accepted;
+    AwaitingDeposit;
+    DepositReceived;
+    ResolverDeposited;
     Completed;
     Cancelled;
     Expired;
@@ -23,6 +24,8 @@ type OrderRequest = record {
 type OrderInfo = record {
     id: nat64;
     creator: principal;
+    creator_btc_address: opt text;
+    creator_sol_address: opt text;
     from_chain: Chain;
     to_chain: Chain;
     from_amount: nat64;
@@ -30,33 +33,111 @@ type OrderInfo = record {
     secret_hash: text;
     status: OrderStatus;
     resolver: opt principal;
+    resolver_btc_address: opt text;
+    resolver_sol_address: opt text;
     created_at: nat64;
     expires_at: nat64;
+    canister_btc_address: text;
+    canister_sol_address: text;
+    creator_deposited: bool;
+    resolver_deposited: bool;
 };
 
-type Result = variant {
-    Ok: nat64;
+type CanisterAddresses = record {
+    bitcoin_address: text;
+    solana_address: text;
+};
+
+type Result_CreateOrder = variant {
+    Ok: record { nat64; CanisterAddresses };
     Err: text;
 };
 
-type Result_1 = variant {
+type Result_Text = variant {
     Ok: text;
     Err: text;
 };
 
+type Result_Addresses = variant {
+    Ok: CanisterAddresses;
+    Err: text;
+};
+
+type Result_Bool = variant {
+    Ok: bool;
+    Err: text;
+};
+
+type Result_Float64 = variant {
+    Ok: float64;
+    Err: text;
+};
+
 service : {
-    // Order management
-    "create_order": (OrderRequest) -> (Result);
-    "accept_order": (nat64) -> (Result_1);
-    "reveal_secret": (nat64, text) -> (Result_1);
-    "cancel_order": (nat64) -> (Result_1);
-    
-    // Balance management
-    "deposit_funds": (Chain, nat64) -> (Result_1);
-    "get_balance": (Chain) -> (nat64) query;
-    
-    // Query orders
+    // ============ Query Functions ============
+    // Get orders waiting for resolvers (status: DepositReceived)
     "get_pending_orders": () -> (vec OrderInfo) query;
+    
+    // Get orders that have expired and need refunds
+    "get_expired_orders": () -> (vec OrderInfo) query;
+    
+    // Get details of a specific order by ID
     "get_order": (nat64) -> (opt OrderInfo) query;
+    
+    // Get all orders created by or assigned to the caller
     "get_my_orders": () -> (vec OrderInfo) query;
+
+    // ============ Update Functions - Blockchain Operations ============
+    // Get canister's Bitcoin and Solana addresses for deposits
+    "get_canister_addresses": () -> (Result_Addresses);
+    
+    // Send Bitcoin from canister to specified address (amount in satoshis)
+    "send_bitcoin": (text, nat64) -> (Result_Text);
+    
+    // Send Solana from canister to specified address (amount in lamports)
+    "send_solana": (text, nat64) -> (Result_Text);
+    
+    // Verify Bitcoin transaction using UTXO checks
+    "verify_bitcoin_transaction": (text, nat64, text) -> (Result_Bool);
+    
+    // Verify Solana transaction and balance
+    "verify_solana_transaction": (text, nat64, text) -> (Result_Bool);
+    
+    // Get Bitcoin balance for any address (returns BTC as float)
+    "get_bitcoin_balance": (text) -> (Result_Float64);
+    
+    // Get Solana balance for any address (returns SOL as float)
+    "get_solana_balance": (text) -> (Result_Float64);
+    
+    // Test function: Send 0.01 SOL to specified address
+    "test_send_sol": (text) -> (Result_Text);
+
+    // ============ Update Functions - Order Management ============
+    // Create a new swap order
+    // Parameters: (OrderRequest, creator_btc_address, creator_sol_address)
+    // Returns: (order_id, canister_addresses)
+    "create_order": (OrderRequest, opt text, opt text) -> (Result_CreateOrder);
+    
+    // Confirm creator's deposit with transaction ID
+    "confirm_deposit": (nat64, text) -> (Result_Text);
+    
+    // Resolver accepts an order
+    // Parameters: (order_id, resolver_btc_address, resolver_sol_address)
+    "accept_order": (nat64, opt text, opt text) -> (Result_Addresses);
+    
+    // Confirm resolver's deposit with transaction ID
+    "confirm_resolver_deposit": (nat64, text) -> (Result_Text);
+    
+    // Reveal secret to complete the swap (HTLC unlock)
+    "reveal_secret": (nat64, text) -> (Result_Text);
+    
+    // Cancel order (only before resolver deposits)
+    "cancel_order": (nat64) -> (Result_Text);
+    
+    // Process refund for expired order
+    "process_refund": (nat64) -> (Result_Text);
+
+    // ============ Deprecated Functions ============
+    // Deprecated: Use external wallets to send funds
+    "deposit_funds": (Chain, nat64) -> (Result_Text);
 }
