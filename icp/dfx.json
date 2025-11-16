@@ -53,9 +53,16 @@
     }
   },
   "defaults": {
-    "build": {
-      "args": "",
-      "packtool": ""
+    "bitcoin": {
+      "enabled": true,
+      "nodes": [
+        "127.0.0.1:18444"
+      ]
+    }
+  },
+  "networks": {
+    "local": {
+      "bind": "127.0.0.1:4943"
     }
   },
   "output_env_file": ".env",

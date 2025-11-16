@@ -23,7 +23,7 @@ use sol_rpc_types::CommitmentLevel;
 #[init]
 fn init() {
     // Initialize Bitcoin module with Testnet (change to Mainnet for production)
-    init_bitcoin(BtcNetwork::Testnet);
+    init_bitcoin(BtcNetwork::Regtest);
 
     // Initialize Solana module with Devnet (change to Mainnet for production)
     let solana_init = SolanaInitArg {
@@ -42,7 +42,7 @@ fn init() {
 #[post_upgrade]
 fn post_upgrade() {
     // Reinitialize Bitcoin module
-    upgrade_bitcoin(BtcNetwork::Testnet);
+    upgrade_bitcoin(BtcNetwork::Regtest);
 
     // Reinitialize Solana module
     let solana_init = SolanaInitArg {
