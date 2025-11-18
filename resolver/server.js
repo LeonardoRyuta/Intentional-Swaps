@@ -14,6 +14,19 @@ dotenv.config();
 
 const ECPair = ECPairFactory(ecc);
 
+// Bitcoin Testnet4 network parameters
+const testnet4 = {
+  messagePrefix: '\x18Bitcoin Signed Message:\n',
+  bech32: 'tb',
+  bip32: {
+    public: 0x043587cf,
+    private: 0x04358394,
+  },
+  pubKeyHash: 0x6f,
+  scriptHash: 0xc4,
+  wif: 0xef,
+};
+
 const app = express();
 app.use(express.json());
 
@@ -55,9 +68,14 @@ function initializeBitcoinWallet() {
   }
 
   try {
-    const network = BITCOIN_NETWORK === 'mainnet'
-      ? bitcoin.networks.bitcoin
-      : bitcoin.networks.testnet;
+    let network;
+    if (BITCOIN_NETWORK === 'mainnet') {
+      network = bitcoin.networks.bitcoin;
+    } else if (BITCOIN_NETWORK === 'testnet4') {
+      network = testnet4;
+    } else {
+      network = bitcoin.networks.testnet;
+    }
 
     // Remove any whitespace
     const cleanKey = btcPrivateKey.trim();
@@ -77,7 +95,7 @@ function initializeBitcoinWallet() {
           throw new Error('Invalid key format');
         }
       } catch (e2) {
-        throw new Error(`Could not parse private key. Expected WIF format (starts with 'c' for testnet, 'K'/'L' for mainnet) or 64-character hex string. Got: ${cleanKey.substring(0, 10)}...`);
+        throw new Error(`Could not parse private key. Expected WIF format (starts with 'c' for testnet/testnet4, 'K'/'L' for mainnet) or 64-character hex string. Got: ${cleanKey.substring(0, 10)}...`);
       }
     }
 
@@ -98,7 +116,7 @@ function initializeBitcoinWallet() {
   } catch (error) {
     console.error('❌ Failed to initialize Bitcoin wallet:', error.message);
     console.error('   Make sure your private key is in WIF format');
-    console.error('   Testnet WIF starts with "c", Mainnet WIF starts with "K" or "L"');
+    console.error('   Testnet/Testnet4 WIF starts with "c", Mainnet WIF starts with "K" or "L"');
     return false;
   }
 }
@@ -189,10 +207,14 @@ async function getBitcoinBalance() {
   if (!btcAddress) return 0;
 
   try {
-    // Use blockstream API for testnet
-    const apiUrl = BITCOIN_NETWORK === 'mainnet'
-      ? `https://blockstream.info/api/address/${btcAddress}`
-      : `https://blockstream.info/testnet/api/address/${btcAddress}`;
+    let apiUrl;
+    if (BITCOIN_NETWORK === 'mainnet') {
+      apiUrl = `https://blockstream.info/api/address/${btcAddress}`;
+    } else if (BITCOIN_NETWORK === 'testnet4') {
+      apiUrl = `https://mempool.space/testnet4/api/address/${btcAddress}`;
+    } else {
+      apiUrl = `https://blockstream.info/testnet/api/address/${btcAddress}`;
+    }
 
     const response = await axios.get(apiUrl);
     const balanceSats = response.data.chain_stats.funded_txo_sum - response.data.chain_stats.spent_txo_sum;
@@ -216,28 +238,181 @@ async function getSolanaBalance() {
   }
 }
 
+// Fetch UTXOs for Bitcoin address
+async function getBitcoinUtxos(address) {
+  try {
+    let apiUrl;
+    if (BITCOIN_NETWORK === 'mainnet') {
+      apiUrl = `https://blockstream.info/api/address/${address}/utxo`;
+    } else if (BITCOIN_NETWORK === 'testnet4') {
+      apiUrl = `https://mempool.space/testnet4/api/address/${address}/utxo`;
+    } else {
+      apiUrl = `https://blockstream.info/testnet/api/address/${address}/utxo`;
+    }
+
+    const response = await axios.get(apiUrl);
+    return response.data;
+  } catch (error) {
+    console.error('Error fetching UTXOs:', error.message);
+    throw new Error(`Failed to fetch UTXOs: ${error.message}`);
+  }
+}
+
+// Broadcast Bitcoin transaction
+async function broadcastBitcoinTransaction(txHex) {
+  try {
+    let apiUrl;
+    if (BITCOIN_NETWORK === 'mainnet') {
+      apiUrl = 'https://blockstream.info/api/tx';
+    } else if (BITCOIN_NETWORK === 'testnet4') {
+      apiUrl = 'https://mempool.space/testnet4/api/tx';
+    } else {
+      apiUrl = 'https://blockstream.info/testnet/api/tx';
+    }
+
+    const response = await axios.post(apiUrl, txHex, {
+      headers: { 'Content-Type': 'text/plain' }
+    });
+
+    return response.data; // Returns txid
+  } catch (error) {
+    if (error.response && error.response.data) {
+      throw new Error(`Failed to broadcast transaction: ${error.response.data}`);
+    }
+    throw new Error(`Failed to broadcast transaction: ${error.message}`);
+  }
+}
+
 // Send Bitcoin transaction
 async function sendBitcoinTransaction(toAddress, amountSats) {
   if (!btcWallet || !btcAddress) {
     throw new Error('Bitcoin wallet not initialized');
   }
 
-  console.log(`📤 Sending ${amountSats} satoshis to ${toAddress}`);
+  console.log(`📤 Preparing Bitcoin transaction...`);
+  console.log(`   From: ${btcAddress}`);
+  console.log(`   To: ${toAddress}`);
+  console.log(`   Amount: ${amountSats} satoshis (${(amountSats / 100000000).toFixed(8)} BTC)`);
 
-  // Note: This is a simplified version. In production, you'd need to:
-  // 1. Fetch UTXOs for your address
-  // 2. Build and sign the transaction properly
-  // 3. Broadcast via a Bitcoin node or API
+  try {
+    // Determine network
+    let network;
+    if (BITCOIN_NETWORK === 'mainnet') {
+      network = bitcoin.networks.bitcoin;
+    } else if (BITCOIN_NETWORK === 'testnet4') {
+      network = testnet4;
+    } else {
+      network = bitcoin.networks.testnet;
+    }
 
-  // For now, we'll simulate this
-  console.warn('⚠️  Bitcoin transaction sending not fully implemented - would send:', {
-    from: btcAddress,
-    to: toAddress,
-    amount: amountSats
-  });
+    // Fetch UTXOs
+    console.log(`   Fetching UTXOs...`);
+    const utxos = await getBitcoinUtxos(btcAddress);
 
-  // Return a dummy txid for now
-  return 'btc_dummy_txid_' + Date.now();
+    if (!utxos || utxos.length === 0) {
+      throw new Error('No UTXOs available. Wallet might be empty or not funded yet.');
+    }
+
+    console.log(`   Found ${utxos.length} UTXO(s)`);
+
+    // Sort UTXOs by value (largest first) for better coin selection
+    utxos.sort((a, b) => b.value - a.value);
+
+    // Select UTXOs to cover the amount + fee
+    const feeRate = 10; // sat/vB - adjust based on network conditions
+    const estimatedSize = 250; // Rough estimate for 1-input, 2-output P2WPKH transaction
+    const estimatedFee = feeRate * estimatedSize;
+    const totalNeeded = amountSats + estimatedFee;
+
+    let selectedUtxos = [];
+    let totalInput = 0;
+
+    for (const utxo of utxos) {
+      selectedUtxos.push(utxo);
+      totalInput += utxo.value;
+
+      if (totalInput >= totalNeeded) {
+        break;
+      }
+    }
+
+    if (totalInput < totalNeeded) {
+      throw new Error(`Insufficient funds. Have ${totalInput} sats, need ${totalNeeded} sats (amount: ${amountSats}, estimated fee: ${estimatedFee})`);
+    }
+
+    console.log(`   Selected ${selectedUtxos.length} UTXO(s), total input: ${totalInput} sats`);
+
+    // Build the transaction
+    const psbt = new bitcoin.Psbt({ network });
+
+    // Add inputs
+    for (const utxo of selectedUtxos) {
+      psbt.addInput({
+        hash: utxo.txid,
+        index: utxo.vout,
+        witnessUtxo: {
+          script: bitcoin.payments.p2wpkh({
+            pubkey: btcWallet.publicKey,
+            network
+          }).output,
+          value: utxo.value,
+        },
+      });
+    }
+
+    // Add output to recipient
+    psbt.addOutput({
+      address: toAddress,
+      value: amountSats,
+    });
+
+    // Calculate actual fee and change
+    const actualSize = psbt.txInputs.length * 68 + psbt.txOutputs.length * 31 + 10; // More accurate size estimation
+    const actualFee = feeRate * actualSize;
+    const change = totalInput - amountSats - actualFee;
+
+    console.log(`   Transaction size: ~${actualSize} vBytes`);
+    console.log(`   Fee: ${actualFee} sats (${feeRate} sat/vB)`);
+    console.log(`   Change: ${change} sats`);
+
+    // Add change output if significant (> dust limit of 546 sats)
+    if (change > 546) {
+      psbt.addOutput({
+        address: btcAddress,
+        value: change,
+      });
+      console.log(`   Added change output: ${change} sats`);
+    } else if (change > 0) {
+      console.log(`   Change (${change} sats) added to fee (too small for output)`);
+    }
+
+    // Sign all inputs
+    console.log(`   Signing transaction...`);
+    for (let i = 0; i < selectedUtxos.length; i++) {
+      psbt.signInput(i, btcWallet);
+    }
+
+    // Finalize and extract transaction
+    psbt.finalizeAllInputs();
+    const tx = psbt.extractTransaction();
+    const txHex = tx.toHex();
+    const txId = tx.getId();
+
+    console.log(`   Transaction ID: ${txId}`);
+    console.log(`   Transaction hex: ${txHex.substring(0, 100)}...`);
+
+    // Broadcast transaction
+    console.log(`   Broadcasting transaction...`);
+    const broadcastResult = await broadcastBitcoinTransaction(txHex);
+
+    console.log(`✅ Bitcoin transaction broadcast successful!`);
+    console.log(`   TXID: ${txId}`);
+
+    return txId;
+  } catch (error) {
+    console.error(`❌ Bitcoin transaction failed:`, error.message);
+    throw error;
+  }
 }
 
 // Send Solana transaction
@@ -602,8 +777,7 @@ async function monitorAcceptedOrders() {
               asset = { SplToken: { mint_address: toAssetInfo.mintAddress, decimals: toAssetInfo.decimals } };
             }
 
-            console.log(`   Resolver should have received: ${formatAmount(toAmount, asset)}`);
-            console.log(`   Check your ${toAssetInfo.type} wallet for funds.`);
+            console.log(`   Creator should have received: ${formatAmount(toAmount, asset)}`);
             acceptedOrders.delete(orderId); // Stop monitoring
           } else if (currentStatus === 'Cancelled' || currentStatus === 'Expired') {
             console.log(`⚠️  Order #${orderId} ${currentStatus.toLowerCase()}`);

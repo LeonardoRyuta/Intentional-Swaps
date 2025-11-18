@@ -280,20 +280,28 @@ pub async fn reveal_secret(order_id: u64, secret: String) -> Result<String, Stri
         return Err("Secret does not match hash".to_string());
     }
 
+    ic_cdk::println!("🔓 Secret verified for order {}. Starting atomic swap...", order_id);
+
     // Execute the atomic swap
     let resolver_address = get_receive_address(
         &order.from_asset,
         order.resolver_btc_address.as_ref(),
         order.resolver_sol_address.as_ref(),
     )?;
+
+    ic_cdk::println!("💸 Sending {:?} (amount: {}) to resolver at {}", order.from_asset, order.from_amount, resolver_address);
     let resolver_tx = send_asset(&order.from_asset, &resolver_address, order.from_amount).await?;
+    ic_cdk::println!("✅ Resolver payment sent successfully! TXID: {}", resolver_tx);
 
     let creator_address = get_receive_address(
         &order.to_asset,
         order.creator_btc_address.as_ref(),
         order.creator_sol_address.as_ref(),
     )?;
+
+    ic_cdk::println!("💸 Sending {:?} (amount: {}) to creator at {}", order.to_asset, order.to_amount, creator_address);
     let creator_tx = send_asset(&order.to_asset, &creator_address, order.to_amount).await?;
+    ic_cdk::println!("✅ Creator payment sent successfully! TXID: {}", creator_tx);
 
     ORDERS.with(|orders| {
         if let Some(ord) = orders.borrow_mut().get_mut(&order_id) {

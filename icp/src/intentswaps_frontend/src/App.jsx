@@ -4,7 +4,7 @@ import { idlFactory, canisterId } from 'declarations/intentswaps_backend';
 import md5 from 'md5';
 import './App.css';
 
-const network = 'local';
+const network = 'ic';
 
 function App() {
   const [view, setView] = useState('swap'); // 'swap', 'orders', 'my-orders'
@@ -14,6 +14,11 @@ function App() {
   const [message, setMessage] = useState('');
   const [actor, setActor] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [autoRevealEnabled, setAutoRevealEnabled] = useState(() => {
+    // Load from localStorage, default to true
+    const saved = localStorage.getItem('autoRevealEnabled');
+    return saved !== null ? JSON.parse(saved) : true;
+  });
 
   // Wallet states
   const [phantomWallet, setPhantomWallet] = useState(null);
@@ -48,11 +53,12 @@ function App() {
   const processedOrdersRef = useRef(new Set());
 
   const agentHost = network === 'ic'
-    ? 'https://icp-api.io' // Mainnet
+    ? 'https://a4gq6-oaaaa-aaaab-qaa4q-cai.raw.icp0.io' // Mainnet
     : 'http://127.0.0.1:4943'; // Local replica
 
   // Initialize anonymous actor on mount
   useEffect(() => {
+    console.log(process.env.REACT_APP_CANISTER_ID_INTENTSWAPS_BACKEND);
     initializeActor();
     checkWalletAvailability();
   }, []);
@@ -97,6 +103,11 @@ function App() {
     }
   }, [unisatWallet, unisatAddress]);
 
+  // Persist autoRevealEnabled setting
+  useEffect(() => {
+    localStorage.setItem('autoRevealEnabled', JSON.stringify(autoRevealEnabled));
+  }, [autoRevealEnabled]);
+
   // Fetch exchange rate on mount and periodically
   useEffect(() => {
     fetchExchangeRate();
@@ -118,7 +129,7 @@ function App() {
 
       const backendActor = Actor.createActor(idlFactory, {
         agent,
-        canisterId,
+        canisterId: "tfpjd-waaaa-aaaam-aewla-cai",
       });
 
       setActor(backendActor);
@@ -214,13 +225,13 @@ function App() {
         setUnisatWallet(window.unisat);
         setUnisatAddress(address);
 
-        // Switch to testnet
+        // Switch to testnet4
         try {
-          await window.unisat.switchNetwork('testnet');
-          showMessage(`Unisat connected (Testnet): ${address.substring(0, 8)}...`);
+          await window.unisat.switchNetwork('testnet4');
+          showMessage(`Unisat connected (Testnet4): ${address.substring(0, 8)}...`);
         } catch (switchError) {
-          console.warn('Could not switch to testnet:', switchError);
-          showMessage(`Unisat connected: ${address.substring(0, 8)}... (Please ensure you're on Testnet)`, true);
+          console.warn('Could not switch to testnet4:', switchError);
+          showMessage(`Unisat connected: ${address.substring(0, 8)}... (Please ensure you're on Testnet4)`, true);
         }
 
         // Load balance immediately after connecting
@@ -438,7 +449,7 @@ function App() {
 
   // Automatically reveal secrets for accepted orders
   useEffect(() => {
-    if (!actor || !myOrders.length) return;
+    if (!actor || !myOrders.length || !autoRevealEnabled) return;
 
     const autoRevealSecrets = async () => {
       for (const order of myOrders) {
@@ -481,7 +492,7 @@ function App() {
     };
 
     autoRevealSecrets();
-  }, [myOrders, actor]);
+  }, [myOrders, actor, autoRevealEnabled]);
 
   const showMessage = (msg, isError = false) => {
     setMessage(msg);
@@ -921,6 +932,71 @@ function App() {
     setLoading(false);
   };
 
+  const handleRetryDeposit = async (order) => {
+    if (!actor) return;
+
+    const orderId = Number(order.id);
+    setLoading(true);
+
+    try {
+      // Get the order details to know where to send funds
+      const fromAsset = Object.keys(order.from_asset)[0];
+      const fromAmount = Number(order.from_amount) / (fromAsset === 'Bitcoin' ? 100000000 : fromAsset === 'Solana' ? 1000000000 : Math.pow(10, order.from_asset.SplToken?.decimals || 9));
+
+      // Get canister addresses for this order
+      const orderDetailsResult = await actor.get_order(BigInt(orderId));
+      if (!('Ok' in orderDetailsResult)) {
+        throw new Error('Could not fetch order details');
+      }
+
+      const orderDetails = orderDetailsResult.Ok;
+      const depositAddress = fromAsset === 'Bitcoin'
+        ? orderDetails.bitcoin_deposit_address
+        : orderDetails.solana_deposit_address;
+
+      showMessage(`Sending deposit for Order #${orderId}...`);
+
+      // Send the transaction from user's wallet
+      let txid;
+      if (fromAsset === 'Bitcoin') {
+        txid = await sendBitcoinTransaction(depositAddress, fromAmount);
+      } else if (fromAsset === 'Solana') {
+        txid = await sendSolanaTransaction(depositAddress, fromAmount);
+      } else if (fromAsset === 'SplToken') {
+        const splToken = order.from_asset.SplToken;
+        txid = await sendSplTokenTransaction(
+          depositAddress,
+          fromAmount,
+          splToken.mint_address,
+          splToken.decimals
+        );
+      }
+
+      if (txid) {
+        showMessage(`Transaction sent! Confirming deposit... (txid: ${txid.substring(0, 10)}...)`);
+
+        // Confirm the deposit with the canister
+        const confirmResult = await actor.confirm_deposit(BigInt(orderId), txid);
+
+        if ('Ok' in confirmResult) {
+          showMessage(`✅ Deposit confirmed for Order #${orderId}!`);
+          await loadOrders();
+          // Reload wallet balances
+          if (fromAsset === 'Bitcoin') {
+            await loadUnisatBalance();
+          } else {
+            await loadPhantomBalance();
+          }
+        } else {
+          showMessage(`Deposit confirmation failed: ${confirmResult.Err}`, true);
+        }
+      }
+    } catch (error) {
+      showMessage(`Error depositing: ${error.message}`, true);
+    }
+    setLoading(false);
+  };
+
   const handleCancelOrder = async (orderId) => {
     if (!actor) return;
     setLoading(true);
@@ -1040,7 +1116,7 @@ function App() {
                 className="btn-connect-wallet bitcoin"
                 onClick={connectUnisat}
                 disabled={walletConnecting}
-                title="Connect Unisat (Bitcoin Testnet)"
+                title="Connect Unisat (Bitcoin Testnet4)"
               >
                 ₿ Unisat
               </button>
@@ -1108,6 +1184,20 @@ function App() {
                       onChange={(e) => setTimeoutMinutes(parseInt(e.target.value))}
                       min="5"
                     />
+                  </div>
+                  <div className="setting-item toggle-setting">
+                    <label>
+                      <span>Auto-reveal secrets</span>
+                      <span className="setting-description">Automatically reveal secrets when resolver deposits</span>
+                    </label>
+                    <label className="toggle-switch">
+                      <input
+                        type="checkbox"
+                        checked={autoRevealEnabled}
+                        onChange={(e) => setAutoRevealEnabled(e.target.checked)}
+                      />
+                      <span className="toggle-slider"></span>
+                    </label>
                   </div>
                 </div>
               )}
@@ -1604,7 +1694,30 @@ function App() {
                           </button>
                         </div>
                       )}
-                      {Object.keys(order.status)[0] === 'Pending' && (
+                      {Object.keys(order.status)[0] === 'AwaitingDeposit' && (
+                        <div className="pending-order-actions">
+                          <div className="status-indicator" style={{ color: '#ff8c00', marginBottom: '0.75rem' }}>
+                            <span>⚠️</span>
+                            <span>Waiting for your deposit</span>
+                          </div>
+                          <button
+                            onClick={() => handleRetryDeposit(order)}
+                            disabled={loading}
+                            className="btn-reveal"
+                            style={{ marginBottom: '0.5rem' }}
+                          >
+                            {loading ? 'Depositing...' : 'Deposit Now'}
+                          </button>
+                          <button
+                            onClick={() => handleCancelOrder(Number(order.id))}
+                            disabled={loading}
+                            className="btn-cancel"
+                          >
+                            {loading ? 'Canceling...' : 'Cancel Order'}
+                          </button>
+                        </div>
+                      )}
+                      {(Object.keys(order.status)[0] === 'DepositReceived' || Object.keys(order.status)[0] === 'Pending') && (
                         <div className="pending-order-actions">
                           {getStoredSecret(Number(order.id)) && (
                             <div className="secret-stored-indicator">

@@ -4,7 +4,7 @@
 
         // Custom CSP to allow CoinGecko API and ICP services
         "headers": {
-            "Content-Security-Policy": "default-src 'self'; connect-src 'self' https://api.coingecko.com https://identity.ic0.app https://icp-api.io http://127.0.0.1:4943 http://localhost:4943 http://*.localhost:4943 https://*.ic0.app https://api.devnet.solana.com wss://api.devnet.solana.com/; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:;"
+            "Content-Security-Policy": "default-src 'self'; connect-src 'self' http://127.0.0.1:4943 http://localhost:4943 https://identity.ic0.app https://icp0.io https://icp-api.io https://api.coingecko.com https://*.localhost:4943 http://*.localhost:4943 https://api.devnet.solana.com wss://api.devnet.solana.com/; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:;"
         },
 
         // Disable the warning since we've customized the policy

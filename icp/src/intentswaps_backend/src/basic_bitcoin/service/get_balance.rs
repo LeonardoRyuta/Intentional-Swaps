@@ -5,6 +5,7 @@ use ic_cdk::{
 };
 
 /// Returns the balance of the given bitcoin address.
+/// Includes pending (unconfirmed) transactions for faster swap verification.
 #[update]
 pub async fn get_balance(address: String) -> u64 {
     let ctx = BTC_CONTEXT.with(|ctx| ctx.get());
@@ -12,7 +13,7 @@ pub async fn get_balance(address: String) -> u64 {
     bitcoin_get_balance(&GetBalanceRequest {
         address,
         network: ctx.network,
-        min_confirmations: None,
+        min_confirmations: Some(0), // Include pending transactions
     })
     .await
     .unwrap()

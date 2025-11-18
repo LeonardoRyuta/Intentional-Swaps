@@ -12,12 +12,13 @@ pub async fn get_canister_btc_address() -> Result<String, String> {
 
 /// Verify a Bitcoin transaction exists and has the correct recipient/amount
 /// Uses UTXO verification to ensure funds were actually received
+/// Includes pending (unconfirmed) transactions for immediate swap verification
 pub async fn verify_bitcoin_transaction(
     recipient_address: String,
     expected_amount: u64,
     _txid: String,
 ) -> Result<bool, String> {
-    // Get UTXOs for the recipient address
+    // Get UTXOs for the recipient address (includes pending transactions)
     let utxos_response = get_utxos::get_utxos(recipient_address.clone()).await;
 
     // Check if there are any UTXOs
@@ -26,11 +27,11 @@ pub async fn verify_bitcoin_transaction(
         return Ok(false);
     }
 
-    // Calculate total balance from UTXOs
+    // Calculate total balance from UTXOs (including pending)
     let total_balance: u64 = utxos_response.utxos.iter().map(|utxo| utxo.value).sum();
 
     ic_cdk::println!(
-        "✅ Bitcoin verification: Address {} has {} satoshis (expected: {})",
+        "✅ Bitcoin verification: Address {} has {} satoshis (expected: {}) - includes pending txs",
         recipient_address,
         total_balance,
         expected_amount
