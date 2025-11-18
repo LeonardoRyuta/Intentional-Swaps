@@ -171,3 +171,196 @@ pub async fn test_send_sol(to_address: String) -> Result<String, String> {
     ic_cdk::println!("✅ Test successful! TX: {}", result);
     Ok(result)
 }
+
+/// Send SPL token from canister to a destination address
+/// Uses the SolanaWallet for proper key management and signing
+pub async fn send_spl_token(
+    to_address: String,
+    amount: u64,
+    mint_address: String,
+) -> Result<String, String> {
+    ic_cdk::println!(
+        "🔄 Sending {} tokens (mint: {}) to Solana address: {}",
+        amount,
+        mint_address,
+        to_address
+    );
+
+    let canister_principal = ic_cdk::api::id();
+    let wallet = SolanaWallet::new(canister_principal).await;
+    let from_account = wallet.solana_account();
+    let from_pubkey = from_account.ed25519_public_key;
+
+    let to_pubkey = SolanaAddress::from_str(&to_address)
+        .map_err(|e| format!("Invalid destination Solana address: {}", e))?;
+
+    let mint_pubkey = SolanaAddress::from_str(&mint_address)
+        .map_err(|e| format!("Invalid mint address: {}", e))?;
+
+    let client = client();
+
+    // Get or create associated token accounts
+    let from_ata = get_associated_token_address(&from_pubkey, &mint_pubkey);
+    let to_ata = get_associated_token_address(&to_pubkey, &mint_pubkey);
+
+    // Create SPL token transfer instruction
+    use crate::basic_solana::spl::transfer_instruction_with_program_id;
+    const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    let token_program = SolanaAddress::from_str(SPL_TOKEN_PROGRAM_ID).unwrap();
+
+    let instruction = transfer_instruction_with_program_id(
+        &from_ata,
+        &to_ata,
+        &from_pubkey,
+        amount,
+        &token_program,
+    );
+
+    // Get recent blockhash
+    let recent_blockhash = client
+        .estimate_recent_blockhash()
+        .send()
+        .await
+        .map_err(|e| format!("Failed to get recent blockhash: {:?}", e))?;
+
+    // Build and sign message using the wallet
+    let message =
+        SolanaMessage::new_with_blockhash(&[instruction], Some(&from_pubkey), &recent_blockhash);
+
+    let signature = from_account.sign_message(&message).await;
+
+    let transaction = SolanaTransaction {
+        message,
+        signatures: vec![signature],
+    };
+
+    // Send transaction
+    let tx_signature = client
+        .send_transaction(transaction)
+        .send()
+        .await
+        .expect_consistent()
+        .map_err(|e| format!("Failed to send SPL token transaction: {:?}", e))?;
+
+    ic_cdk::println!("✅ SPL tokens sent! TX: {}", tx_signature.to_string());
+    Ok(tx_signature.to_string())
+}
+
+/// Get SPL token balance for an address
+pub async fn get_spl_token_balance(address: String, mint_address: String) -> Result<u64, String> {
+    use sol_rpc_types::GetTokenAccountBalanceParams;
+
+    let owner_pubkey =
+        SolanaAddress::from_str(&address).map_err(|e| format!("Invalid owner address: {}", e))?;
+
+    let mint_pubkey = SolanaAddress::from_str(&mint_address)
+        .map_err(|e| format!("Invalid mint address: {}", e))?;
+
+    // Get associated token account address
+    let ata = get_associated_token_address(&owner_pubkey, &mint_pubkey);
+
+    let params = GetTokenAccountBalanceParams {
+        pubkey: ata.into(),
+        commitment: Some(CommitmentLevel::Confirmed),
+    };
+
+    let client = client();
+    let balance_response = client
+        .get_token_account_balance(params)
+        .send()
+        .await
+        .expect_consistent()
+        .map_err(|e| format!("Failed to get token balance: {:?}", e))?;
+
+    // Parse amount from ui_amount_string or amount
+    let amount = balance_response
+        .amount
+        .parse::<u64>()
+        .map_err(|e| format!("Failed to parse token amount: {}", e))?;
+
+    Ok(amount)
+}
+
+/// Verify SPL token transaction
+pub async fn verify_spl_token_transaction(
+    recipient_address: String,
+    expected_amount: u64,
+    mint_address: String,
+    txid: String,
+) -> Result<bool, String> {
+    ic_cdk::println!("🔍 Verifying SPL token transaction: {}", txid);
+
+    // First, verify the transaction exists and was successful
+    let signature = Signature::from_str(&txid).map_err(|e| format!("Invalid signature: {}", e))?;
+
+    let client = client();
+
+    use sol_rpc_types::GetTransactionEncoding;
+    let params = GetTransactionParams {
+        signature,
+        encoding: Some(GetTransactionEncoding::Base64),
+        commitment: Some(CommitmentLevel::Confirmed),
+        max_supported_transaction_version: Some(0),
+    };
+
+    let tx = client
+        .get_transaction(params)
+        .send()
+        .await
+        .expect_consistent()
+        .map_err(|e| format!("Failed to get transaction: {:?}", e))?;
+
+    // Check if transaction exists and was successful
+    let tx_valid = if let Some(tx) = tx {
+        if let Some(meta) = &tx.transaction.meta {
+            if meta.err.is_none() {
+                ic_cdk::println!("✅ Transaction found and successful");
+                true
+            } else {
+                ic_cdk::println!("❌ Transaction found but failed: {:?}", meta.err);
+                false
+            }
+        } else {
+            ic_cdk::println!("❌ Transaction found but no metadata");
+            false
+        }
+    } else {
+        ic_cdk::println!("❌ Transaction not found");
+        false
+    };
+
+    if !tx_valid {
+        return Ok(false);
+    }
+
+    // Verify token balance
+    let balance = get_spl_token_balance(recipient_address.clone(), mint_address).await?;
+
+    ic_cdk::println!(
+        "✅ SPL token verification: Address {} has {} tokens (expected: {})",
+        recipient_address,
+        balance,
+        expected_amount
+    );
+
+    Ok(balance >= expected_amount)
+}
+
+/// Helper function to derive associated token address
+/// This follows the SPL Associated Token Account Program derivation
+fn get_associated_token_address(owner: &SolanaAddress, mint: &SolanaAddress) -> SolanaAddress {
+    const SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID: &str =
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+    let associated_token_program =
+        SolanaAddress::from_str(SPL_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM_ID).unwrap();
+
+    // Find program address for associated token account
+    // Seeds: [owner, token_program_id, mint]
+    const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    let token_program = SolanaAddress::from_str(SPL_TOKEN_PROGRAM_ID).unwrap();
+
+    let seeds = &[owner.as_ref(), token_program.as_ref(), mint.as_ref()];
+
+    let (address, _bump) = SolanaAddress::find_program_address(seeds, &associated_token_program);
+    address
+}

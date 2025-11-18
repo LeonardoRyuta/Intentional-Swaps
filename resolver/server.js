@@ -3,6 +3,7 @@ import { Actor, HttpAgent } from '@dfinity/agent';
 import { idlFactory } from './declarations/intentswaps_backend/intentswaps_backend.did.js';
 import dotenv from 'dotenv';
 import { Connection, Keypair, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL, sendAndConfirmTransaction } from '@solana/web3.js';
+import { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction, createTransferInstruction, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, getAccount } from '@solana/spl-token';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ECPairFactory } from 'ecpair';
 import * as ecc from 'tiny-secp256k1';
@@ -271,6 +272,98 @@ async function sendSolanaTransaction(toAddress, amountLamports) {
   }
 }
 
+// Send SPL Token transaction
+async function sendSplTokenTransaction(toAddress, amountAtoms, mintAddress) {
+  if (!solWallet || !solanaConnection) {
+    throw new Error('Solana wallet not initialized');
+  }
+
+  console.log(`📤 Sending ${amountAtoms} token atoms (mint: ${mintAddress.substring(0, 8)}...) to ${toAddress}`);
+
+  try {
+    const mintPubkey = new PublicKey(mintAddress);
+    const fromPubkey = solWallet.publicKey;
+    const toPubkey = new PublicKey(toAddress);
+
+    // Get Associated Token Accounts
+    const fromATA = await getAssociatedTokenAddress(
+      mintPubkey,
+      fromPubkey,
+      false,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+    const toATA = await getAssociatedTokenAddress(
+      mintPubkey,
+      toPubkey,
+      false,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+    console.log(`   From ATA: ${fromATA.toString()}`);
+    console.log(`   To ATA: ${toATA.toString()}`);
+
+    // Check sender's token balance
+    const fromTokenAccount = await getAccount(solanaConnection, fromATA);
+    console.log(`   Token balance: ${fromTokenAccount.amount.toString()}`);
+
+    if (fromTokenAccount.amount < BigInt(amountAtoms)) {
+      throw new Error(`Insufficient token balance. Have ${fromTokenAccount.amount}, need ${amountAtoms}`);
+    }
+
+    const transaction = new Transaction();
+
+    // Check if destination ATA exists, if not create it
+    try {
+      await getAccount(solanaConnection, toATA);
+      console.log('   Destination ATA exists');
+    } catch (ataError) {
+      if (ataError.name === 'TokenAccountNotFoundError') {
+        console.log('   Creating destination ATA...');
+        transaction.add(
+          createAssociatedTokenAccountInstruction(
+            fromPubkey,
+            toATA,
+            toPubkey,
+            mintPubkey,
+            TOKEN_PROGRAM_ID,
+            ASSOCIATED_TOKEN_PROGRAM_ID
+          )
+        );
+      } else {
+        throw ataError;
+      }
+    }
+
+    // Add transfer instruction
+    transaction.add(
+      createTransferInstruction(
+        fromATA,
+        toATA,
+        fromPubkey,
+        BigInt(amountAtoms),
+        [],
+        TOKEN_PROGRAM_ID
+      )
+    );
+
+    const signature = await sendAndConfirmTransaction(
+      solanaConnection,
+      transaction,
+      [solWallet],
+      { commitment: 'confirmed' }
+    );
+
+    console.log('✅ SPL Token transaction confirmed:', signature);
+    return signature;
+  } catch (error) {
+    console.error('❌ SPL Token transaction failed:', error.message);
+    throw error;
+  }
+}
+
 // Initialize connection to ICP canister
 async function initializeAgent() {
   try {
@@ -297,22 +390,80 @@ async function initializeAgent() {
   }
 }
 
+// Get asset info from Asset enum
+function getAssetInfo(asset) {
+  if (asset.Bitcoin !== undefined) {
+    return { type: 'Bitcoin', decimals: 8 };
+  } else if (asset.Solana !== undefined) {
+    return { type: 'Solana', decimals: 9 };
+  } else if (asset.SplToken !== undefined) {
+    return {
+      type: 'SplToken',
+      mintAddress: asset.SplToken.mint_address,
+      decimals: asset.SplToken.decimals
+    };
+  }
+  return { type: 'Unknown', decimals: 0 };
+}
+
+// Format amount for display
+function formatAmount(amount, asset) {
+  const assetInfo = getAssetInfo(asset);
+  const value = Number(amount) / Math.pow(10, assetInfo.decimals);
+
+  if (assetInfo.type === 'Bitcoin') {
+    return `${value.toFixed(8)} BTC`;
+  } else if (assetInfo.type === 'Solana') {
+    return `${value.toFixed(4)} SOL`;
+  } else if (assetInfo.type === 'SplToken') {
+    return `${value.toFixed(assetInfo.decimals)} (${assetInfo.mintAddress.substring(0, 8)}...)`;
+  }
+  return value.toString();
+}
+
 // Check if resolver has sufficient balance
 async function hasSufficientBalance(order) {
   try {
-    const toChain = Object.keys(order.to_chain)[0];
+    const toAssetInfo = getAssetInfo(order.to_asset);
     const toAmount = Number(order.to_amount);
 
-    if (toChain === 'Bitcoin') {
+    if (toAssetInfo.type === 'Bitcoin') {
       const btcBalance = await getBitcoinBalance();
       const hasFunds = btcBalance >= toAmount;
       console.log(`   BTC Balance: ${btcBalance / 100000000} BTC, Required: ${toAmount / 100000000} BTC`);
       return hasFunds;
-    } else if (toChain === 'Solana') {
+    } else if (toAssetInfo.type === 'Solana') {
       const solBalance = await getSolanaBalance();
       const hasFunds = solBalance >= toAmount;
       console.log(`   SOL Balance: ${solBalance / LAMPORTS_PER_SOL} SOL, Required: ${toAmount / LAMPORTS_PER_SOL} SOL`);
       return hasFunds;
+    } else if (toAssetInfo.type === 'SplToken') {
+      // Check SPL token balance
+      try {
+        const mintPubkey = new PublicKey(toAssetInfo.mintAddress);
+        const ata = await getAssociatedTokenAddress(
+          mintPubkey,
+          solWallet.publicKey,
+          false,
+          TOKEN_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        );
+
+        const tokenAccount = await getAccount(solanaConnection, ata);
+        const tokenBalance = Number(tokenAccount.amount);
+        const hasFunds = tokenBalance >= toAmount;
+
+        console.log(`   SPL Token Balance: ${tokenBalance / Math.pow(10, toAssetInfo.decimals)} tokens, Required: ${toAmount / Math.pow(10, toAssetInfo.decimals)} tokens`);
+        console.log(`   Mint: ${toAssetInfo.mintAddress}`);
+
+        return hasFunds;
+      } catch (error) {
+        if (error.name === 'TokenAccountNotFoundError') {
+          console.log(`   ⚠️  No token account for mint ${toAssetInfo.mintAddress.substring(0, 8)}...`);
+          return false;
+        }
+        throw error;
+      }
     }
 
     return false;
@@ -330,25 +481,25 @@ async function processOrder(order) {
     return; // Already processed
   }
 
-  const fromChain = Object.keys(order.from_chain)[0];
-  const toChain = Object.keys(order.to_chain)[0];
+  const fromAssetInfo = getAssetInfo(order.from_asset);
+  const toAssetInfo = getAssetInfo(order.to_asset);
   const fromAmount = Number(order.from_amount);
   const toAmount = Number(order.to_amount);
 
   console.log(`\n📋 New order detected: #${orderId}`);
-  console.log(`   From: ${fromChain} (${fromChain === 'Bitcoin' ? (fromAmount / 100000000).toFixed(8) : (fromAmount / LAMPORTS_PER_SOL).toFixed(4)} ${fromChain === 'Bitcoin' ? 'BTC' : 'SOL'})`);
-  console.log(`   To: ${toChain} (${toChain === 'Bitcoin' ? (toAmount / 100000000).toFixed(8) : (toAmount / LAMPORTS_PER_SOL).toFixed(4)} ${toChain === 'Bitcoin' ? 'BTC' : 'SOL'})`);
+  console.log(`   From: ${formatAmount(fromAmount, order.from_asset)}`);
+  console.log(`   To: ${formatAmount(toAmount, order.to_asset)}`);
   console.log(`   Creator deposited: ${order.creator_deposited}`);
   console.log(`   Resolver deposited: ${order.resolver_deposited}`);
 
   // Check if we have the required wallet
-  if (toChain === 'Bitcoin' && !btcWallet) {
+  if (toAssetInfo.type === 'Bitcoin' && !btcWallet) {
     console.log(`⚠️  Bitcoin wallet not configured, skipping order #${orderId}`);
     processedOrders.add(orderId);
     return;
   }
 
-  if (toChain === 'Solana' && !solWallet) {
+  if ((toAssetInfo.type === 'Solana' || toAssetInfo.type === 'SplToken') && !solWallet) {
     console.log(`⚠️  Solana wallet not configured, skipping order #${orderId}`);
     processedOrders.add(orderId);
     return;
@@ -379,12 +530,16 @@ async function processOrder(order) {
 
       // Send the required funds to canister
       let txid;
-      if (toChain === 'Bitcoin') {
-        console.log(`📤 Sending ${toAmount / 100000000} BTC to canister...`);
+      if (toAssetInfo.type === 'Bitcoin') {
+        console.log(`📤 Sending ${formatAmount(toAmount, order.to_asset)} to canister...`);
         txid = await sendBitcoinTransaction(canisterAddresses.bitcoin_address, toAmount);
-      } else {
-        console.log(`📤 Sending ${toAmount / LAMPORTS_PER_SOL} SOL to canister...`);
+      } else if (toAssetInfo.type === 'Solana') {
+        console.log(`📤 Sending ${formatAmount(toAmount, order.to_asset)} to canister...`);
         txid = await sendSolanaTransaction(canisterAddresses.solana_address, toAmount);
+      } else if (toAssetInfo.type === 'SplToken') {
+        console.log(`📤 Sending ${formatAmount(toAmount, order.to_asset)} to canister...`);
+        console.log(`   Mint: ${toAssetInfo.mintAddress}`);
+        txid = await sendSplTokenTransaction(canisterAddresses.solana_address, toAmount, toAssetInfo.mintAddress);
       }
 
       console.log(`   Transaction ID: ${txid}`);
@@ -400,7 +555,7 @@ async function processOrder(order) {
         acceptedOrders.set(orderId, {
           acceptedAt: Date.now(),
           lastStatus: 'ResolverDeposited',
-          toChain,
+          toAssetInfo,
           toAmount
         });
         console.log(`   👁️  Now monitoring order #${orderId} for completion...`);
@@ -434,10 +589,21 @@ async function monitorAcceptedOrders() {
           console.log(`\n🔔 Order #${orderId} status changed: ${orderInfo.lastStatus} → ${currentStatus}`);
 
           if (currentStatus === 'Completed') {
-            const { toChain, toAmount } = orderInfo;
+            const { toAssetInfo, toAmount } = orderInfo;
             console.log(`✅ Order #${orderId} completed!`);
-            console.log(`   Resolver should have received: ${toChain === 'Bitcoin' ? (toAmount / 100000000).toFixed(8) : (toAmount / LAMPORTS_PER_SOL).toFixed(4)} ${toChain === 'Bitcoin' ? 'BTC' : 'SOL'}`);
-            console.log(`   Check your ${toChain} wallet for funds.`);
+
+            // Build asset for display
+            let asset;
+            if (toAssetInfo.type === 'Bitcoin') {
+              asset = { Bitcoin: null };
+            } else if (toAssetInfo.type === 'Solana') {
+              asset = { Solana: null };
+            } else if (toAssetInfo.type === 'SplToken') {
+              asset = { SplToken: { mint_address: toAssetInfo.mintAddress, decimals: toAssetInfo.decimals } };
+            }
+
+            console.log(`   Resolver should have received: ${formatAmount(toAmount, asset)}`);
+            console.log(`   Check your ${toAssetInfo.type} wallet for funds.`);
             acceptedOrders.delete(orderId); // Stop monitoring
           } else if (currentStatus === 'Cancelled' || currentStatus === 'Expired') {
             console.log(`⚠️  Order #${orderId} ${currentStatus.toLowerCase()}`);

@@ -1,4 +1,4 @@
-use crate::types::{Order, OrderInfo, Chain};
+use crate::types::{Chain, Order, OrderInfo};
 use candid::Principal;
 use ic_cdk::api::time;
 use std::cell::RefCell;
@@ -80,6 +80,41 @@ pub fn get_my_orders(caller: Principal) -> Vec<OrderInfo> {
     })
 }
 
+/// Get all orders associated with a Bitcoin or Solana wallet address
+pub fn get_orders_by_wallet(
+    btc_address: Option<String>,
+    sol_address: Option<String>,
+) -> Vec<OrderInfo> {
+    let canister_btc = CANISTER_BTC_ADDRESS
+        .with(|addr| addr.borrow().clone())
+        .unwrap_or_default();
+    let canister_sol = CANISTER_SOL_ADDRESS
+        .with(|addr| addr.borrow().clone())
+        .unwrap_or_default();
+
+    ORDERS.with(|orders| {
+        orders
+            .borrow()
+            .values()
+            .filter(|order| {
+                // Check if the wallet address matches either creator or resolver addresses
+                let btc_match = btc_address.as_ref().map_or(false, |addr| {
+                    order.creator_btc_address.as_ref().map_or(false, |ca| ca == addr)
+                        || order.resolver_btc_address.as_ref().map_or(false, |ra| ra == addr)
+                });
+
+                let sol_match = sol_address.as_ref().map_or(false, |addr| {
+                    order.creator_sol_address.as_ref().map_or(false, |ca| ca == addr)
+                        || order.resolver_sol_address.as_ref().map_or(false, |ra| ra == addr)
+                });
+
+                btc_match || sol_match
+            })
+            .map(|order| order_to_info(order, &canister_btc, &canister_sol))
+            .collect()
+    })
+}
+
 /// Get all expired orders that need refunds
 pub fn get_expired_orders() -> Vec<OrderInfo> {
     let current_time = time();
@@ -114,8 +149,8 @@ fn order_to_info(order: &Order, canister_btc: &str, canister_sol: &str) -> Order
         creator: order.creator,
         creator_btc_address: order.creator_btc_address.clone(),
         creator_sol_address: order.creator_sol_address.clone(),
-        from_chain: order.from_chain.clone(),
-        to_chain: order.to_chain.clone(),
+        from_asset: order.from_asset.clone(),
+        to_asset: order.to_asset.clone(),
         from_amount: order.from_amount,
         to_amount: order.to_amount,
         secret_hash: order.secret_hash.clone(),

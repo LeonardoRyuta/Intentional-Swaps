@@ -23,7 +23,7 @@ use sol_rpc_types::CommitmentLevel;
 #[init]
 fn init() {
     // Initialize Bitcoin module with Testnet (change to Mainnet for production)
-    init_bitcoin(BtcNetwork::Regtest);
+    init_bitcoin(BtcNetwork::Testnet);
 
     // Initialize Solana module with Devnet (change to Mainnet for production)
     let solana_init = SolanaInitArg {
@@ -42,7 +42,7 @@ fn init() {
 #[post_upgrade]
 fn post_upgrade() {
     // Reinitialize Bitcoin module
-    upgrade_bitcoin(BtcNetwork::Regtest);
+    upgrade_bitcoin(BtcNetwork::Testnet);
 
     // Reinitialize Solana module
     let solana_init = SolanaInitArg {
@@ -76,6 +76,14 @@ fn get_order(order_id: u64) -> Option<OrderInfo> {
 fn get_my_orders() -> Vec<OrderInfo> {
     let caller = ic_cdk::api::caller();
     storage::get_my_orders(caller)
+}
+
+#[ic_cdk::query]
+fn get_orders_by_wallet(
+    btc_address: Option<String>,
+    sol_address: Option<String>,
+) -> Vec<OrderInfo> {
+    storage::get_orders_by_wallet(btc_address, sol_address)
 }
 
 // Direct API exports for blockchain operations
@@ -125,6 +133,37 @@ async fn get_solana_balance(address: String) -> Result<f64, String> {
 #[ic_cdk::update]
 async fn test_send_sol(to_address: String) -> Result<String, String> {
     solana_integration::test_send_sol(to_address).await
+}
+
+// ============ SPL Token Functions ============
+#[ic_cdk::update]
+async fn send_spl_token(
+    to_address: String,
+    amount: u64,
+    mint_address: String,
+) -> Result<String, String> {
+    solana_integration::send_spl_token(to_address, amount, mint_address).await
+}
+
+#[ic_cdk::update]
+async fn get_spl_token_balance(address: String, mint_address: String) -> Result<u64, String> {
+    solana_integration::get_spl_token_balance(address, mint_address).await
+}
+
+#[ic_cdk::update]
+async fn verify_spl_token_transaction(
+    recipient_address: String,
+    expected_amount: u64,
+    mint_address: String,
+    txid: String,
+) -> Result<bool, String> {
+    solana_integration::verify_spl_token_transaction(
+        recipient_address,
+        expected_amount,
+        mint_address,
+        txid,
+    )
+    .await
 }
 
 // Legacy compatibility functions (deprecated)

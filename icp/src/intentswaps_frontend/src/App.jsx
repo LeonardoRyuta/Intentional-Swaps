@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Actor, HttpAgent } from '@dfinity/agent';
 import { idlFactory, canisterId } from 'declarations/intentswaps_backend';
 import md5 from 'md5';
@@ -24,19 +24,28 @@ function App() {
   const [unisatBalance, setUnisatBalance] = useState(0);
   const [walletConnecting, setWalletConnecting] = useState(false);
 
-  // Form states
-  const [fromChain, setFromChain] = useState('Bitcoin');
-  const [toChain, setToChain] = useState('Solana');
+  // Form states - now using Asset enum
+  const [fromAssetType, setFromAssetType] = useState('Bitcoin'); // 'Bitcoin', 'Solana', 'SplToken'
+  const [toAssetType, setToAssetType] = useState('Solana');
   const [fromAmount, setFromAmount] = useState('');
   const [toAmount, setToAmount] = useState('');
   const [secret, setSecret] = useState('');
   const [secretHash, setSecretHash] = useState('');
   const [timeoutMinutes, setTimeoutMinutes] = useState(60);
 
+  // SPL Token specific fields
+  const [fromMintAddress, setFromMintAddress] = useState('');
+  const [fromDecimals, setFromDecimals] = useState(9);
+  const [toMintAddress, setToMintAddress] = useState('');
+  const [toDecimals, setToDecimals] = useState(9);
+
   // Exchange rate state
   const [exchangeRate, setExchangeRate] = useState(null);
   const [loadingRate, setLoadingRate] = useState(false);
   const [rateError, setRateError] = useState('');
+
+  // Track which orders have been processed for auto-reveal to prevent infinite loops
+  const processedOrdersRef = useRef(new Set());
 
   const agentHost = network === 'ic'
     ? 'https://icp-api.io' // Mainnet
@@ -60,7 +69,7 @@ function App() {
     }
   };
 
-  // Poll for orders when actor is available
+  // Poll for orders when actor is available - include wallet addresses in dependencies
   useEffect(() => {
     if (!actor) return;
 
@@ -69,7 +78,7 @@ function App() {
       loadOrders();
     }, 5000);
     return () => clearInterval(interval);
-  }, [actor]);
+  }, [actor, unisatAddress, phantomAddress]);
 
   // Poll wallet balances when wallets are connected
   useEffect(() => {
@@ -258,31 +267,18 @@ function App() {
   const loadOrders = async () => {
     if (!actor) return;
     try {
+      // Get all pending orders for the "Orders" view
       const allPending = await actor.get_pending_orders();
-
-      // "Orders" view shows ALL pending orders (for resolvers to see available swaps)
       setOrders(allPending);
 
-      // "My Orders" view shows only orders created BY or accepted BY the current user's wallets
+      // Use the new backend function to get orders by wallet address
       if (unisatAddress || phantomAddress) {
-        const myFilteredOrders = allPending.filter(order => {
-          // Check if this order was created by current wallet addresses
-          const creatorBtcAddr = order.creator_btc_address;
-          const creatorSolAddr = order.creator_sol_address;
-
-          // Check if this order was accepted by current wallet addresses (resolver)
-          const resolverBtcAddr = order.resolver_btc_address;
-          const resolverSolAddr = order.resolver_sol_address;
-
-          const isCreator = (unisatAddress && creatorBtcAddr === unisatAddress) ||
-            (phantomAddress && creatorSolAddr === phantomAddress);
-
-          const isResolver = (unisatAddress && resolverBtcAddr === unisatAddress) ||
-            (phantomAddress && resolverSolAddr === phantomAddress);
-
-          return isCreator || isResolver;
-        });
-        setMyOrders(myFilteredOrders);
+        const walletOrders = await actor.get_orders_by_wallet(
+          unisatAddress ? [unisatAddress] : [],
+          phantomAddress ? [phantomAddress] : []
+        );
+        setMyOrders(walletOrders);
+        console.log(`Loaded ${walletOrders.length} orders for connected wallets`);
       } else {
         setMyOrders([]);
       }
@@ -356,8 +352,14 @@ function App() {
     }
   };
 
-  // Auto-calculate toAmount when fromAmount or chains change
+  // Auto-calculate toAmount when fromAmount or assets change
   useEffect(() => {
+    // Only auto-calculate for BTC <-> SOL swaps
+    if (fromAssetType === 'SplToken' || toAssetType === 'SplToken') {
+      // For SPL tokens, user must enter manually
+      return;
+    }
+
     if (!fromAmount || !exchangeRate) {
       setToAmount('');
       return;
@@ -371,24 +373,24 @@ function App() {
 
     let calculatedAmount;
 
-    if (fromChain === 'Bitcoin' && toChain === 'Solana') {
+    if (fromAssetType === 'Bitcoin' && toAssetType === 'Solana') {
       // BTC to SOL: multiply by rate
       calculatedAmount = fromValue * exchangeRate;
-    } else if (fromChain === 'Solana' && toChain === 'Bitcoin') {
+    } else if (fromAssetType === 'Solana' && toAssetType === 'Bitcoin') {
       // SOL to BTC: divide by rate
       calculatedAmount = fromValue / exchangeRate;
     } else {
-      // Same chain (shouldn't happen, but handle it)
+      // Same asset (shouldn't happen, but handle it)
       calculatedAmount = fromValue;
     }
 
     // Format to appropriate decimal places
-    const formatted = toChain === 'Bitcoin'
+    const formatted = toAssetType === 'Bitcoin'
       ? calculatedAmount.toFixed(8)
       : calculatedAmount.toFixed(4);
 
     setToAmount(formatted);
-  }, [fromAmount, fromChain, toChain, exchangeRate]);
+  }, [fromAmount, fromAssetType, toAssetType, exchangeRate]);
 
   const generateSecret = () => {
     const randomSecret = Math.random().toString(36).substring(2, 15) +
@@ -443,23 +445,35 @@ function App() {
         const orderId = Number(order.id);
         const status = Object.keys(order.status)[0];
 
-        // If order is accepted and we have the secret stored
-        if (status === 'Accepted') {
+        // Skip if already processed
+        if (processedOrdersRef.current.has(orderId)) {
+          continue;
+        }
+
+        // If order resolver has deposited and we have the secret stored
+        if (status === 'ResolverDeposited') {
           const storedSecret = getStoredSecret(orderId);
           if (storedSecret) {
             console.log(`Auto-revealing secret for order ${orderId}`);
+            // Mark as processed immediately to prevent duplicate attempts
+            processedOrdersRef.current.add(orderId);
+
             try {
               const result = await actor.reveal_secret(BigInt(orderId), storedSecret);
               if ('Ok' in result) {
                 showMessage(`Secret automatically revealed for Order #${orderId}!`);
                 removeStoredSecret(orderId);
-                await loadOrders();
-                await loadBalances();
+                // Reload orders after successful reveal
+                setTimeout(() => loadOrders(), 1000);
               } else {
                 console.error(`Failed to reveal secret for order ${orderId}:`, result.Err);
+                // Remove from processed set if failed so it can be retried
+                processedOrdersRef.current.delete(orderId);
               }
             } catch (error) {
               console.error(`Error auto-revealing secret for order ${orderId}:`, error);
+              // Remove from processed set if error so it can be retried
+              processedOrdersRef.current.delete(orderId);
             }
           }
         }
@@ -480,21 +494,26 @@ function App() {
     e.preventDefault();
     if (!actor) return;
 
-    // Validate wallet connections
-    if (fromChain === 'Bitcoin' && !unisatAddress) {
-      showMessage('Please connect your Unisat wallet first', true);
+    // Validate wallet connections based on asset types (only check required wallets)
+    const needsBitcoinWallet = fromAssetType === 'Bitcoin' || toAssetType === 'Bitcoin';
+    const needsSolanaWallet = fromAssetType === 'Solana' || fromAssetType === 'SplToken' || toAssetType === 'Solana' || toAssetType === 'SplToken';
+
+    if (needsBitcoinWallet && !unisatAddress) {
+      showMessage('Please connect your Unisat wallet for Bitcoin transactions', true);
       return;
     }
-    if (fromChain === 'Solana' && !phantomAddress) {
-      showMessage('Please connect your Phantom wallet first', true);
+    if (needsSolanaWallet && !phantomAddress) {
+      showMessage('Please connect your Phantom wallet for Solana transactions', true);
       return;
     }
-    if (toChain === 'Bitcoin' && !unisatAddress) {
-      showMessage('Please connect your Unisat wallet to receive BTC', true);
+
+    // Validate SPL token fields
+    if (fromAssetType === 'SplToken' && !fromMintAddress) {
+      showMessage('Please enter the SPL token mint address', true);
       return;
     }
-    if (toChain === 'Solana' && !phantomAddress) {
-      showMessage('Please connect your Phantom wallet to receive SOL', true);
+    if (toAssetType === 'SplToken' && !toMintAddress) {
+      showMessage('Please enter the SPL token mint address', true);
       return;
     }
 
@@ -507,14 +526,37 @@ function App() {
         return;
       }
 
-      const fromChainVariant = fromChain === 'Bitcoin' ? { Bitcoin: null } : { Solana: null };
-      const toChainVariant = toChain === 'Bitcoin' ? { Bitcoin: null } : { Solana: null };
+      // Build Asset variants based on asset type
+      const fromAssetVariant = fromAssetType === 'Bitcoin'
+        ? { Bitcoin: null }
+        : fromAssetType === 'Solana'
+          ? { Solana: null }
+          : { SplToken: { mint_address: fromMintAddress, decimals: fromDecimals } };
+
+      const toAssetVariant = toAssetType === 'Bitcoin'
+        ? { Bitcoin: null }
+        : toAssetType === 'Solana'
+          ? { Solana: null }
+          : { SplToken: { mint_address: toMintAddress, decimals: toDecimals } };
+
+      // Calculate smallest unit multiplier based on asset type
+      const fromMultiplier = fromAssetType === 'Bitcoin'
+        ? 100000000 // satoshis
+        : fromAssetType === 'Solana'
+          ? 1000000000 // lamports
+          : Math.pow(10, fromDecimals); // token atoms
+
+      const toMultiplier = toAssetType === 'Bitcoin'
+        ? 100000000
+        : toAssetType === 'Solana'
+          ? 1000000000
+          : Math.pow(10, toDecimals);
 
       const request = {
-        from_chain: fromChainVariant,
-        to_chain: toChainVariant,
-        from_amount: BigInt(Math.floor(parseFloat(fromAmount) * (fromChain === 'Bitcoin' ? 100000000 : 1000000000))),
-        to_amount: BigInt(Math.floor(parseFloat(toAmount) * (toChain === 'Bitcoin' ? 100000000 : 1000000000))),
+        from_asset: fromAssetVariant,
+        to_asset: toAssetVariant,
+        from_amount: BigInt(Math.floor(parseFloat(fromAmount) * fromMultiplier)),
+        to_amount: BigInt(Math.floor(parseFloat(toAmount) * toMultiplier)),
         secret_hash: secretHash,
         timeout_seconds: BigInt(timeoutMinutes * 60),
       };
@@ -537,15 +579,23 @@ function App() {
         // Now send the transaction from user's wallet
         let txid;
         try {
-          if (fromChain === 'Bitcoin') {
+          if (fromAssetType === 'Bitcoin') {
             txid = await sendBitcoinTransaction(
               canisterAddresses.bitcoin_address,
               parseFloat(fromAmount)
             );
-          } else {
+          } else if (fromAssetType === 'Solana') {
             txid = await sendSolanaTransaction(
               canisterAddresses.solana_address,
               parseFloat(fromAmount)
+            );
+          } else {
+            // SPL Token
+            txid = await sendSplTokenTransaction(
+              canisterAddresses.solana_address,
+              parseFloat(fromAmount),
+              fromMintAddress,
+              fromDecimals
             );
           }
 
@@ -559,7 +609,7 @@ function App() {
               showMessage(`✅ Order #${orderId} created and deposit confirmed! Waiting for resolver...`);
               await loadOrders();
               // Reload wallet balances
-              if (fromChain === 'Bitcoin') {
+              if (fromAssetType === 'Bitcoin') {
                 await loadUnisatBalance();
               } else {
                 await loadPhantomBalance();
@@ -574,7 +624,10 @@ function App() {
             }
           }
         } catch (txError) {
-          showMessage(`Order #${orderId} created but transaction failed: ${txError.message}. Please send funds manually to: ${fromChain === 'Bitcoin' ? canisterAddresses.bitcoin_address : canisterAddresses.solana_address}`, true);
+          const depositAddress = fromAssetType === 'Bitcoin'
+            ? canisterAddresses.bitcoin_address
+            : canisterAddresses.solana_address;
+          showMessage(`Order #${orderId} created but transaction failed: ${txError.message}. Please send funds manually to: ${depositAddress}`, true);
         }
       } else {
         showMessage(result.Err, true);
@@ -663,6 +716,182 @@ function App() {
     }
   };
 
+  // Send SPL Token transaction via Phantom
+  const sendSplTokenTransaction = async (toAddress, amountTokens, mintAddress, decimals) => {
+    if (!phantomWallet) {
+      throw new Error('Phantom wallet not connected');
+    }
+
+    try {
+      // Import Solana web3 and SPL Token dynamically
+      const { Connection, PublicKey, Transaction } = await import('@solana/web3.js');
+      const {
+        getAssociatedTokenAddress,
+        createAssociatedTokenAccountInstruction,
+        createTransferInstruction,
+        TOKEN_PROGRAM_ID,
+        ASSOCIATED_TOKEN_PROGRAM_ID,
+        getAccount
+      } = await import('@solana/spl-token');
+
+      // Connect to Solana devnet
+      const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
+
+      // Validate inputs
+      if (!mintAddress || mintAddress.length !== 44) {
+        throw new Error('Invalid mint address');
+      }
+
+      // Convert token amount to smallest unit
+      const amountAtoms = BigInt(Math.floor(amountTokens * Math.pow(10, decimals)));
+
+      if (amountAtoms <= 0) {
+        throw new Error('Amount must be greater than 0');
+      }
+
+      console.log('Transfer details:', {
+        amount: amountTokens,
+        decimals,
+        amountAtoms: amountAtoms.toString(),
+        mint: mintAddress
+      });
+
+      const mintPubkey = new PublicKey(mintAddress);
+      const fromPubkey = window.solana.publicKey;
+      const toPubkey = new PublicKey(toAddress);
+
+      // Get Associated Token Accounts
+      const fromATA = await getAssociatedTokenAddress(
+        mintPubkey,
+        fromPubkey,
+        false,
+        TOKEN_PROGRAM_ID,
+        ASSOCIATED_TOKEN_PROGRAM_ID
+      );
+
+      const toATA = await getAssociatedTokenAddress(
+        mintPubkey,
+        toPubkey,
+        false,
+        TOKEN_PROGRAM_ID,
+        ASSOCIATED_TOKEN_PROGRAM_ID
+      );
+
+      console.log('ATAs:', {
+        from: fromATA.toString(),
+        to: toATA.toString()
+      });
+
+      // Check sender's token account exists and has balance
+      let fromTokenAccount;
+      try {
+        fromTokenAccount = await getAccount(connection, fromATA);
+        console.log('Sender token balance:', fromTokenAccount.amount.toString());
+
+        if (fromTokenAccount.amount < amountAtoms) {
+          throw new Error(`Insufficient token balance. You have ${fromTokenAccount.amount.toString()} but trying to send ${amountAtoms.toString()}`);
+        }
+      } catch (error) {
+        if (error.name === 'TokenAccountNotFoundError') {
+          throw new Error('You do not have a token account for this token. Please add this token to your Phantom wallet first.');
+        }
+        throw error;
+      }
+
+      // Create transaction
+      const transaction = new Transaction();
+
+      // Check if destination ATA exists, if not create it
+      let needsATACreation = false;
+      try {
+        await getAccount(connection, toATA);
+        console.log('Destination ATA exists');
+      } catch (ataError) {
+        if (ataError.name === 'TokenAccountNotFoundError') {
+          console.log('Destination ATA does not exist, will create it');
+          needsATACreation = true;
+
+          transaction.add(
+            createAssociatedTokenAccountInstruction(
+              fromPubkey,
+              toATA,
+              toPubkey,
+              mintPubkey,
+              TOKEN_PROGRAM_ID,
+              ASSOCIATED_TOKEN_PROGRAM_ID
+            )
+          );
+          showMessage('Creating token account for receiver...');
+        } else {
+          throw ataError;
+        }
+      }
+
+      // Add transfer instruction
+      transaction.add(
+        createTransferInstruction(
+          fromATA,
+          toATA,
+          fromPubkey,
+          amountAtoms,
+          [],
+          TOKEN_PROGRAM_ID
+        )
+      );
+
+      // Get recent blockhash with proper options
+      const { blockhash } = await connection.getLatestBlockhash('confirmed');
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = fromPubkey;
+
+      console.log('Transaction prepared:', {
+        instructions: transaction.instructions.length,
+        needsATACreation
+      });
+
+      const message = needsATACreation
+        ? 'Please confirm the transaction to create token account and transfer tokens...'
+        : 'Please confirm the SPL token transfer in your Phantom wallet...';
+      showMessage(message);
+
+      // Sign and send via Phantom
+      const signed = await window.solana.signAndSendTransaction(transaction);
+      const signature = typeof signed === 'string' ? signed : signed.signature;
+
+      console.log('SPL Token transaction sent:', signature);
+
+      // Wait for confirmation
+      showMessage('Waiting for transaction confirmation...');
+      await connection.confirmTransaction(signature, 'confirmed');
+
+      return signature;
+    } catch (error) {
+      console.error('SPL Token transaction error:', error);
+      console.error('Error details:', {
+        name: error.name,
+        message: error.message,
+        code: error.code,
+        stack: error.stack
+      });
+
+      if (error.message?.includes('User rejected') || error.code === 4001) {
+        throw new Error('Transaction cancelled by user');
+      }
+
+      if (error.message?.includes('Attempt to debit an account but found no record of a prior credit')) {
+        throw new Error('Insufficient token balance. Make sure you have enough tokens and SOL for fees.');
+      }
+
+      if (error.message?.includes('TokenAccountNotFoundError')) {
+        throw new Error('Token account not found. Make sure the token mint address is correct.');
+      }
+
+      // Provide more helpful error message
+      const errorMsg = error.message || error.toString();
+      throw new Error('SPL Token transaction failed: ' + errorMsg + '. Check console for details.');
+    }
+  };
+
   const handleRevealSecret = async (orderId) => {
     if (!actor) return;
 
@@ -682,7 +911,6 @@ function App() {
         showMessage(result.Ok);
         removeStoredSecret(orderId);
         await loadOrders();
-        await loadBalances();
         setSecret('');
       } else {
         showMessage(result.Err, true);
@@ -702,7 +930,6 @@ function App() {
       if ('Ok' in result) {
         showMessage(result.Ok);
         await loadOrders();
-        await loadBalances();
       } else {
         showMessage(result.Err, true);
       }
@@ -712,24 +939,49 @@ function App() {
     setLoading(false);
   };
 
-  const formatAmount = (amount, chain) => {
+  const formatAmount = (amount, asset) => {
     const amountNum = Number(amount);
-    if (chain === 'Bitcoin') {
+
+    // Handle different asset types
+    if (asset.Bitcoin !== undefined) {
       return (amountNum / 100000000).toFixed(8) + ' BTC';
-    } else {
+    } else if (asset.Solana !== undefined) {
       return (amountNum / 1000000000).toFixed(4) + ' SOL';
+    } else if (asset.SplToken !== undefined) {
+      const decimals = asset.SplToken.decimals;
+      const formatted = (amountNum / Math.pow(10, decimals)).toFixed(decimals);
+      const shortMint = asset.SplToken.mint_address.substring(0, 6);
+      return `${formatted} (${shortMint}...)`;
     }
+    return amountNum.toString();
+  };
+
+  const getAssetSymbol = (asset) => {
+    if (asset.Bitcoin !== undefined) return '₿';
+    if (asset.Solana !== undefined) return '◎';
+    if (asset.SplToken !== undefined) return '💠';
+    return '?';
+  };
+
+  const getAssetName = (asset) => {
+    if (asset.Bitcoin !== undefined) return 'Bitcoin';
+    if (asset.Solana !== undefined) return 'Solana';
+    if (asset.SplToken !== undefined) {
+      const shortMint = asset.SplToken.mint_address.substring(0, 6);
+      return `SPL ${shortMint}...`;
+    }
+    return 'Unknown';
   };
 
   const getStatusColor = (status) => {
     const statusKey = Object.keys(status)[0];
     switch (statusKey) {
-      case 'Pending': return '#ffa500';
-      case 'Accepted': return '#4169e1';
-      case 'Completed': return '#32cd32';
-      case 'Cancelled': return '#dc143c';
-      case 'Expired': return '#808080';
-      default: return '#ffffff';
+      case 'Pending': return '#ff8c00';
+      case 'Accepted': return '#2563eb';
+      case 'Completed': return '#16a34a';
+      case 'Cancelled': return '#dc2626';
+      case 'Expired': return '#6b7280';
+      default: return '#9ca3af';
     }
   };
 
@@ -860,142 +1112,269 @@ function App() {
                 </div>
               )}
 
-              {/* Wallet Connection Notice */}
-              {(!unisatAddress || !phantomAddress) && (
-                <div className="wallet-notice">
-                  <div className="notice-icon">🔐</div>
-                  <div className="notice-content">
-                    <h4>Connect Your Wallets</h4>
-                    <p>You need to connect both wallets to create swaps:</p>
-                    <div className="wallet-requirements">
-                      {!unisatAddress && (
-                        <div className="wallet-requirement">
-                          <span className="requirement-icon">₿</span>
-                          <span>Unisat wallet for Bitcoin (Testnet)</span>
-                          <button className="btn-connect-inline" onClick={connectUnisat}>
-                            Connect Unisat
-                          </button>
-                        </div>
-                      )}
-                      {!phantomAddress && (
-                        <div className="wallet-requirement">
-                          <span className="requirement-icon">◎</span>
-                          <span>Phantom wallet for Solana (Devnet)</span>
-                          <button className="btn-connect-inline" onClick={connectPhantom}>
-                            Connect Phantom
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                    <p className="notice-info">
-                      💡 Your wallet addresses are used to send deposits and receive swapped funds
-                    </p>
-                  </div>
-                </div>
-              )}
-
               <form onSubmit={handleCreateOrder}>
-                {/* From Token */}
-                <div className="token-input-container">
-                  <div className="token-input-header">
-                    <label>You pay</label>
-                    <span className="balance-display">
-                      Balance: {fromChain === 'Bitcoin'
-                        ? `${unisatBalance.toFixed(8)} BTC`
-                        : `${phantomBalance.toFixed(4)} SOL`}
-                    </span>
-                  </div>
-                  <div className="token-input-row">
-                    <input
-                      type="number"
-                      step="0.00000001"
-                      value={fromAmount}
-                      onChange={(e) => setFromAmount(e.target.value)}
-                      placeholder="0.0"
-                      className="amount-input"
-                      required
-                    />
-                    <select
-                      value={fromChain}
-                      onChange={(e) => setFromChain(e.target.value)}
-                      className="token-select"
-                    >
-                      <option value="Bitcoin">₿ Bitcoin</option>
-                      <option value="Solana">◎ Solana</option>
-                    </select>
-                  </div>
-                </div>
+                {/* Horizontal Swap Layout */}
+                <div className="swap-horizontal-container">
+                  {/* From Asset */}
+                  <div className="token-input-container">
+                    <div className="token-input-header">
+                      <label>You pay</label>
+                      <span className="balance-display">
+                        Balance: {fromAssetType === 'Bitcoin'
+                          ? `${unisatBalance.toFixed(8)} BTC`
+                          : `${phantomBalance.toFixed(4)} SOL`}
+                      </span>
+                    </div>
 
-                {/* Swap Arrow with Exchange Rate */}
-                <div className="swap-arrow-container">
-                  <button
-                    type="button"
-                    className="swap-arrow-btn"
-                    onClick={() => {
-                      const tempChain = fromChain;
-                      const tempAmount = fromAmount;
-                      setFromChain(toChain);
-                      setFromAmount(toAmount);
-                      setToChain(tempChain);
-                      setToAmount(tempAmount);
-                    }}
-                    title="Switch tokens"
-                  >
-                    ⇅
-                  </button>
-                  {exchangeRate && (
-                    <div className="exchange-rate-display">
-                      {loadingRate ? (
-                        <span className="rate-loading">Updating rate...</span>
-                      ) : (
-                        <>
-                          <span className="rate-label">Rate:</span>
+                    {/* Asset Type Selector */}
+                    <div className="asset-type-selector">
+                      <label className="radio-option">
+                        <input
+                          type="radio"
+                          name="fromAssetType"
+                          value="Bitcoin"
+                          checked={fromAssetType === 'Bitcoin'}
+                          onChange={(e) => setFromAssetType(e.target.value)}
+                        />
+                        <span>₿ Bitcoin</span>
+                      </label>
+                      <label className="radio-option">
+                        <input
+                          type="radio"
+                          name="fromAssetType"
+                          value="Solana"
+                          checked={fromAssetType === 'Solana'}
+                          onChange={(e) => setFromAssetType(e.target.value)}
+                        />
+                        <span>◎ Solana</span>
+                      </label>
+                      <label className="radio-option">
+                        <input
+                          type="radio"
+                          name="fromAssetType"
+                          value="SplToken"
+                          checked={fromAssetType === 'SplToken'}
+                          onChange={(e) => setFromAssetType(e.target.value)}
+                        />
+                        <span>🪙 SPL Token</span>
+                      </label>
+                    </div>
+
+                    {/* SPL Token Fields */}
+                    {fromAssetType === 'SplToken' && (
+                      <div className="spl-token-fields">
+                        <input
+                          type="text"
+                          value={fromMintAddress}
+                          onChange={(e) => setFromMintAddress(e.target.value)}
+                          placeholder="Token Mint Address (e.g., EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v for USDC)"
+                          className="mint-address-input"
+                          required={fromAssetType === 'SplToken'}
+                        />
+                        <input
+                          type="number"
+                          value={fromDecimals}
+                          onChange={(e) => setFromDecimals(parseInt(e.target.value))}
+                          placeholder="Decimals"
+                          min="0"
+                          max="18"
+                          className="decimals-input"
+                          required={fromAssetType === 'SplToken'}
+                        />
+                        <div className="popular-tokens">
+                          <span className="popular-label">Popular:</span>
+                          <button
+                            type="button"
+                            className="token-shortcut"
+                            onClick={() => {
+                              setFromMintAddress('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+                              setFromDecimals(6);
+                            }}
+                          >
+                            USDC
+                          </button>
+                          <button
+                            type="button"
+                            className="token-shortcut"
+                            onClick={() => {
+                              setFromMintAddress('Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB');
+                              setFromDecimals(6);
+                            }}
+                          >
+                            USDT
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="token-input-row">
+                      <input
+                        type="number"
+                        step="0.00000001"
+                        value={fromAmount}
+                        onChange={(e) => setFromAmount(e.target.value)}
+                        placeholder="0.0"
+                        className="amount-input"
+                        required
+                      />
+                    </div>
+                  </div>
+
+                  {/* Swap Arrow with Exchange Rate */}
+                  <div className="swap-arrow-container">
+                    <button
+                      type="button"
+                      className="swap-arrow-btn"
+                      onClick={() => {
+                        const tempAssetType = fromAssetType;
+                        const tempAmount = fromAmount;
+                        const tempMint = fromMintAddress;
+                        const tempDecimals = fromDecimals;
+
+                        setFromAssetType(toAssetType);
+                        setFromAmount(toAmount);
+                        setFromMintAddress(toMintAddress);
+                        setFromDecimals(toDecimals);
+
+                        setToAssetType(tempAssetType);
+                        setToAmount(tempAmount);
+                        setToMintAddress(tempMint);
+                        setToDecimals(tempDecimals);
+                      }}
+                      title="Switch tokens"
+                    >
+                      ⇄
+                    </button>
+                    {exchangeRate && fromAssetType !== 'SplToken' && toAssetType !== 'SplToken' && (
+                      <div className="exchange-rate-display">
+                        {loadingRate ? (
+                          <span className="rate-loading">Updating...</span>
+                        ) : (
                           <span className="rate-value">
                             1 BTC = {exchangeRate.toFixed(2)} SOL
                           </span>
-                        </>
-                      )}
-                    </div>
-                  )}
-                  {rateError && (
-                    <div className="rate-error">{rateError}</div>
-                  )}
-                </div>
+                        )}
+                      </div>
+                    )}
+                    {rateError && fromAssetType !== 'SplToken' && toAssetType !== 'SplToken' && (
+                      <div className="rate-error">⚠️</div>
+                    )}
+                    {(fromAssetType === 'SplToken' || toAssetType === 'SplToken') && (
+                      <div className="spl-rate-notice">
+                        💡 Manual
+                      </div>
+                    )}
+                  </div>
 
-                {/* To Token */}
-                <div className="token-input-container">
-                  <div className="token-input-header">
-                    <label>You receive (estimated)</label>
-                    <span className="balance-display">
-                      Balance: {toChain === 'Bitcoin'
-                        ? `${unisatBalance.toFixed(8)} BTC`
-                        : `${phantomBalance.toFixed(4)} SOL`}
-                    </span>
-                  </div>
-                  <div className="token-input-row">
-                    <input
-                      type="number"
-                      step="0.00000001"
-                      value={toAmount}
-                      onChange={(e) => setToAmount(e.target.value)}
-                      placeholder="0.0"
-                      className="amount-input calculated-amount"
-                      title="Auto-calculated based on current exchange rate. You can edit this value."
-                    />
-                    <select
-                      value={toChain}
-                      onChange={(e) => setToChain(e.target.value)}
-                      className="token-select"
-                    >
-                      <option value="Bitcoin">₿ Bitcoin</option>
-                      <option value="Solana">◎ Solana</option>
-                    </select>
-                  </div>
-                  {toAmount && (
-                    <div className="auto-calc-indicator">
-                      <span>💡</span> Auto-calculated at current market rate
+                  {/* To Asset */}
+                  <div className="token-input-container">
+                    <div className="token-input-header">
+                      <label>You receive</label>
+                      <span className="balance-display">
+                        Balance: {toAssetType === 'Bitcoin'
+                          ? `${unisatBalance.toFixed(8)} BTC`
+                          : `${phantomBalance.toFixed(4)} SOL`}
+                      </span>
                     </div>
-                  )}
+
+                    {/* Asset Type Selector */}
+                    <div className="asset-type-selector">
+                      <label className="radio-option">
+                        <input
+                          type="radio"
+                          name="toAssetType"
+                          value="Bitcoin"
+                          checked={toAssetType === 'Bitcoin'}
+                          onChange={(e) => setToAssetType(e.target.value)}
+                        />
+                        <span>₿ Bitcoin</span>
+                      </label>
+                      <label className="radio-option">
+                        <input
+                          type="radio"
+                          name="toAssetType"
+                          value="Solana"
+                          checked={toAssetType === 'Solana'}
+                          onChange={(e) => setToAssetType(e.target.value)}
+                        />
+                        <span>◎ Solana</span>
+                      </label>
+                      <label className="radio-option">
+                        <input
+                          type="radio"
+                          name="toAssetType"
+                          value="SplToken"
+                          checked={toAssetType === 'SplToken'}
+                          onChange={(e) => setToAssetType(e.target.value)}
+                        />
+                        <span>🪙 SPL Token</span>
+                      </label>
+                    </div>
+
+                    {/* SPL Token Fields */}
+                    {toAssetType === 'SplToken' && (
+                      <div className="spl-token-fields">
+                        <input
+                          type="text"
+                          value={toMintAddress}
+                          onChange={(e) => setToMintAddress(e.target.value)}
+                          placeholder="Token Mint Address (e.g., EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v for USDC)"
+                          className="mint-address-input"
+                          required={toAssetType === 'SplToken'}
+                        />
+                        <input
+                          type="number"
+                          value={toDecimals}
+                          onChange={(e) => setToDecimals(parseInt(e.target.value))}
+                          placeholder="Decimals"
+                          min="0"
+                          max="18"
+                          className="decimals-input"
+                          required={toAssetType === 'SplToken'}
+                        />
+                        <div className="popular-tokens">
+                          <span className="popular-label">Popular:</span>
+                          <button
+                            type="button"
+                            className="token-shortcut"
+                            onClick={() => {
+                              setToMintAddress('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+                              setToDecimals(6);
+                            }}
+                          >
+                            USDC
+                          </button>
+                          <button
+                            type="button"
+                            className="token-shortcut"
+                            onClick={() => {
+                              setToMintAddress('Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB');
+                              setToDecimals(6);
+                            }}
+                          >
+                            USDT
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="token-input-row">
+                      <input
+                        type="number"
+                        step="0.00000001"
+                        value={toAmount}
+                        onChange={(e) => setToAmount(e.target.value)}
+                        placeholder="0.0"
+                        className="amount-input"
+                        required
+                      />
+                    </div>
+                    {toAmount && fromAssetType !== 'SplToken' && toAssetType !== 'SplToken' && (
+                      <div className="auto-calc-indicator">
+                        <span>💡</span> Auto-calculated at current market rate
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 {/* Secret Section */}
@@ -1024,54 +1403,23 @@ function App() {
                 {/* Submit Button */}
                 <button
                   type="submit"
-                  disabled={loading || !secretHash || !unisatAddress || !phantomAddress}
+                  disabled={loading || !secretHash ||
+                    (fromAssetType === 'Bitcoin' && !unisatAddress) ||
+                    ((fromAssetType === 'Solana' || fromAssetType === 'SplToken') && !phantomAddress) ||
+                    (toAssetType === 'Bitcoin' && !unisatAddress) ||
+                    ((toAssetType === 'Solana' || toAssetType === 'SplToken') && !phantomAddress)}
                   className="btn-swap"
                 >
                   {loading ? 'Processing...' :
-                    !unisatAddress || !phantomAddress ? 'Connect Both Wallets First' :
-                      !secretHash ? 'Generate Secret First' :
-                        'Create Swap & Send Deposit'}
+                    !secretHash ? 'Generate Secret First' :
+                      (fromAssetType === 'Bitcoin' || toAssetType === 'Bitcoin') && !unisatAddress ? 'Connect Unisat Wallet' :
+                        (fromAssetType === 'Solana' || fromAssetType === 'SplToken' || toAssetType === 'Solana' || toAssetType === 'SplToken') && !phantomAddress ? 'Connect Phantom Wallet' :
+                          'Create Swap & Send Deposit'}
                 </button>
-                {(unisatAddress && phantomAddress) && (
-                  <div className="swap-info-text">
-                    ✓ Transaction will be sent from your wallet automatically
-                  </div>
-                )}
+                <div className="swap-info-text">
+                  ✓ Transaction will be sent from your wallet automatically
+                </div>
               </form>
-            </div>
-
-            {/* Info Card */}
-            <div className="info-card">
-              <h3>💡 How it works</h3>
-              <ol>
-                <li>Connect both Unisat (Bitcoin) and Phantom (Solana) wallets</li>
-                <li>Generate a secret hash for your swap</li>
-                <li>Create order - your wallet automatically sends the deposit</li>
-                <li>A resolver accepts and fulfills your order</li>
-                <li>Secret is auto-revealed and you receive funds in your wallet ✨</li>
-              </ol>
-              <div className="info-feature">
-                <span className="feature-badge">🔐 Non-Custodial</span>
-                <p>You maintain full control of your funds. Your wallet signs all transactions, and the canister verifies them on-chain.</p>
-              </div>
-              <div className="info-feature">
-                <span className="feature-badge">🤖 Automated</span>
-                <p>Deposits are sent automatically from your wallet. Secrets are revealed automatically. Just connect and swap!</p>
-              </div>
-              <div className="info-stats">
-                <div className="stat">
-                  <span className="stat-label">Network</span>
-                  <span className="stat-value">BTC Testnet • SOL Devnet</span>
-                </div>
-                <div className="stat">
-                  <span className="stat-label">Active Orders</span>
-                  <span className="stat-value">{orders.length}</span>
-                </div>
-                <div className="stat">
-                  <span className="stat-label">Type</span>
-                  <span className="stat-value">Non-Custodial DEX</span>
-                </div>
-              </div>
             </div>
           </div>
         )}
@@ -1095,7 +1443,7 @@ function App() {
               </div>
             ) : (
               <div className="orders-grid">
-                {orders.map(order => (
+                {[...orders].sort((a, b) => Number(b.id) - Number(a.id)).map(order => (
                   <div key={Number(order.id)} className="order-card">
                     <div className="order-card-header">
                       <div className="order-id">Order #{Number(order.id)}</div>
@@ -1110,13 +1458,13 @@ function App() {
                     <div className="order-swap-info">
                       <div className="order-token">
                         <span className="token-symbol">
-                          {Object.keys(order.from_chain)[0] === 'Bitcoin' ? '₿' : '◎'}
+                          {getAssetSymbol(order.from_asset)}
                         </span>
                         <div className="token-details">
                           <div className="token-amount">
-                            {formatAmount(order.from_amount, Object.keys(order.from_chain)[0])}
+                            {formatAmount(order.from_amount, order.from_asset)}
                           </div>
-                          <div className="token-name">{Object.keys(order.from_chain)[0]}</div>
+                          <div className="token-name">{getAssetName(order.from_asset)}</div>
                         </div>
                       </div>
 
@@ -1124,30 +1472,22 @@ function App() {
 
                       <div className="order-token">
                         <span className="token-symbol">
-                          {Object.keys(order.to_chain)[0] === 'Bitcoin' ? '₿' : '◎'}
+                          {getAssetSymbol(order.to_asset)}
                         </span>
                         <div className="token-details">
                           <div className="token-amount">
-                            {formatAmount(order.to_amount, Object.keys(order.to_chain)[0])}
+                            {formatAmount(order.to_amount, order.to_asset)}
                           </div>
-                          <div className="token-name">{Object.keys(order.to_chain)[0]}</div>
+                          <div className="token-name">{getAssetName(order.to_asset)}</div>
                         </div>
                       </div>
                     </div>
 
                     <div className="order-meta">
-                      {order.creator_btc_address?.[0] && (
-                        <div>
-                          <span className="meta-label">Creator BTC:</span>
-                          <code className="meta-value">{order.creator_btc_address[0].substring(0, 8)}...{order.creator_btc_address[0].substring(order.creator_btc_address[0].length - 4)}</code>
-                        </div>
-                      )}
-                      {order.creator_sol_address?.[0] && (
-                        <div>
-                          <span className="meta-label">Creator SOL:</span>
-                          <code className="meta-value">{order.creator_sol_address[0].substring(0, 8)}...{order.creator_sol_address[0].substring(order.creator_sol_address[0].length - 4)}</code>
-                        </div>
-                      )}
+                      <div>
+                        <span className="meta-label">Created:</span>
+                        <span className="meta-value">{new Date(Number(order.created_at) / 1000000).toLocaleString()}</span>
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -1175,7 +1515,7 @@ function App() {
               </div>
             ) : (
               <div className="orders-grid">
-                {myOrders.map(order => (
+                {[...myOrders].sort((a, b) => Number(b.id) - Number(a.id)).map(order => (
                   <div key={Number(order.id)} className="order-card my-order">
                     <div className="order-card-header">
                       <div className="order-id">Order #{Number(order.id)}</div>
@@ -1190,13 +1530,13 @@ function App() {
                     <div className="order-swap-info">
                       <div className="order-token">
                         <span className="token-symbol">
-                          {Object.keys(order.from_chain)[0] === 'Bitcoin' ? '₿' : '◎'}
+                          {getAssetSymbol(order.from_asset)}
                         </span>
                         <div className="token-details">
                           <div className="token-amount">
-                            {formatAmount(order.from_amount, Object.keys(order.from_chain)[0])}
+                            {formatAmount(order.from_amount, order.from_asset)}
                           </div>
-                          <div className="token-name">{Object.keys(order.from_chain)[0]}</div>
+                          <div className="token-name">{getAssetName(order.from_asset)}</div>
                         </div>
                       </div>
 
@@ -1204,36 +1544,34 @@ function App() {
 
                       <div className="order-token">
                         <span className="token-symbol">
-                          {Object.keys(order.to_chain)[0] === 'Bitcoin' ? '₿' : '◎'}
+                          {getAssetSymbol(order.to_asset)}
                         </span>
                         <div className="token-details">
                           <div className="token-amount">
-                            {formatAmount(order.to_amount, Object.keys(order.to_chain)[0])}
+                            {formatAmount(order.to_amount, order.to_asset)}
                           </div>
-                          <div className="token-name">{Object.keys(order.to_chain)[0]}</div>
+                          <div className="token-name">{getAssetName(order.to_asset)}</div>
                         </div>
                       </div>
                     </div>
 
-                    {(order.resolver_btc_address?.[0] || order.resolver_sol_address?.[0]) && (
-                      <div className="order-meta">
-                        {order.resolver_btc_address?.[0] && (
-                          <div>
-                            <span className="meta-label">Resolver BTC:</span>
-                            <code className="meta-value">{order.resolver_btc_address[0].substring(0, 8)}...{order.resolver_btc_address[0].substring(order.resolver_btc_address[0].length - 4)}</code>
-                          </div>
-                        )}
-                        {order.resolver_sol_address?.[0] && (
-                          <div>
-                            <span className="meta-label">Resolver SOL:</span>
-                            <code className="meta-value">{order.resolver_sol_address[0].substring(0, 8)}...{order.resolver_sol_address[0].substring(order.resolver_sol_address[0].length - 4)}</code>
-                          </div>
-                        )}
+                    <div className="order-meta">
+                      {order.resolver && (
+                        <div>
+                          <span className="meta-label">Status:</span>
+                          <span className="meta-value">
+                            {order.resolver_deposited ? 'Resolver deposited' : 'Waiting for resolver deposit'}
+                          </span>
+                        </div>
+                      )}
+                      <div>
+                        <span className="meta-label">Created:</span>
+                        <span className="meta-value">{new Date(Number(order.created_at) / 1000000).toLocaleString()}</span>
                       </div>
-                    )}
+                    </div>
 
                     <div className="order-actions">
-                      {Object.keys(order.status)[0] === 'Accepted' && getStoredSecret(Number(order.id)) && (
+                      {Object.keys(order.status)[0] === 'ResolverDeposited' && getStoredSecret(Number(order.id)) && (
                         <div className="auto-reveal-status">
                           <div className="status-indicator">
                             <span className="spinner">⏳</span>
@@ -1248,7 +1586,7 @@ function App() {
                           </button>
                         </div>
                       )}
-                      {Object.keys(order.status)[0] === 'Accepted' && !getStoredSecret(Number(order.id)) && (
+                      {Object.keys(order.status)[0] === 'ResolverDeposited' && !getStoredSecret(Number(order.id)) && (
                         <div className="reveal-secret-section">
                           <input
                             type="text"

@@ -11,19 +11,30 @@ pub enum OrderStatus {
     Expired,           // Order expired
 }
 
-#[derive(CandidType, Deserialize, Clone, Debug)]
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
 pub enum Chain {
     Bitcoin,
     Solana,
 }
 
+// Represents an asset on a blockchain
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub enum Asset {
+    Bitcoin, // Native BTC
+    Solana,  // Native SOL
+    SplToken {
+        mint_address: String, // SPL token mint address
+        decimals: u8,         // Token decimals (e.g., 6 for USDC, 9 for most tokens)
+    },
+}
+
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct OrderRequest {
-    pub from_chain: Chain,
-    pub to_chain: Chain,
-    pub from_amount: u64,     // Amount in satoshis for BTC or lamports for SOL
-    pub to_amount: u64,       // Amount in satoshis for BTC or lamports for SOL
-    pub secret_hash: String,  // MD5 hash of the secret
+    pub from_asset: Asset,
+    pub to_asset: Asset,
+    pub from_amount: u64, // Amount in smallest unit (satoshis/lamports/token atoms)
+    pub to_amount: u64,   // Amount in smallest unit
+    pub secret_hash: String, // MD5 hash of the secret
     pub timeout_seconds: u64, // Time before order expires
 }
 
@@ -32,9 +43,9 @@ pub struct Order {
     pub id: u64,
     pub creator: Principal,
     pub creator_btc_address: Option<String>, // User's Bitcoin address for refunds
-    pub creator_sol_address: Option<String>, // User's Solana address for refunds
-    pub from_chain: Chain,
-    pub to_chain: Chain,
+    pub creator_sol_address: Option<String>, // User's Solana address for refunds/receives
+    pub from_asset: Asset,
+    pub to_asset: Asset,
     pub from_amount: u64,
     pub to_amount: u64,
     pub secret_hash: String,
@@ -58,8 +69,8 @@ pub struct OrderInfo {
     pub creator: Principal,
     pub creator_btc_address: Option<String>,
     pub creator_sol_address: Option<String>,
-    pub from_chain: Chain,
-    pub to_chain: Chain,
+    pub from_asset: Asset,
+    pub to_asset: Asset,
     pub from_amount: u64,
     pub to_amount: u64,
     pub secret_hash: String,

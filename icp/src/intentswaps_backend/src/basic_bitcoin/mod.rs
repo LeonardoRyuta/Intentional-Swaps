@@ -34,8 +34,8 @@ pub struct BitcoinContext {
 thread_local! {
     static BTC_CONTEXT: Cell<BitcoinContext> = const {
         Cell::new(BitcoinContext {
-            network: Network::Regtest,
-            bitcoin_network: bitcoin::Network::Regtest,
+            network: Network::Testnet,
+            bitcoin_network: bitcoin::Network::Testnet,
             key_name: "test_key_1",
         })
     };

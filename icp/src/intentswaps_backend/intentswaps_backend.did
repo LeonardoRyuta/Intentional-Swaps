@@ -3,6 +3,15 @@ type Chain = variant {
     Solana;
 };
 
+type Asset = variant {
+    Bitcoin;
+    Solana;
+    SplToken: record {
+        mint_address: text;
+        decimals: nat8;
+    };
+};
+
 type OrderStatus = variant {
     AwaitingDeposit;
     DepositReceived;
@@ -13,8 +22,8 @@ type OrderStatus = variant {
 };
 
 type OrderRequest = record {
-    from_chain: Chain;
-    to_chain: Chain;
+    from_asset: Asset;
+    to_asset: Asset;
     from_amount: nat64;
     to_amount: nat64;
     secret_hash: text;
@@ -26,8 +35,8 @@ type OrderInfo = record {
     creator: principal;
     creator_btc_address: opt text;
     creator_sol_address: opt text;
-    from_chain: Chain;
-    to_chain: Chain;
+    from_asset: Asset;
+    to_asset: Asset;
     from_amount: nat64;
     to_amount: nat64;
     secret_hash: text;
@@ -86,6 +95,9 @@ service : {
     
     // Get all orders created by or assigned to the caller
     "get_my_orders": () -> (vec OrderInfo) query;
+    
+    // Get all orders associated with specific Bitcoin or Solana wallet addresses
+    "get_orders_by_wallet": (opt text, opt text) -> (vec OrderInfo) query;
 
     // ============ Update Functions - Blockchain Operations ============
     // Get canister's Bitcoin and Solana addresses for deposits
@@ -111,6 +123,16 @@ service : {
     
     // Test function: Send 0.01 SOL to specified address
     "test_send_sol": (text) -> (Result_Text);
+    
+    // ============ Update Functions - SPL Token Operations ============
+    // Send SPL tokens from canister to specified address
+    "send_spl_token": (text, nat64, text) -> (Result_Text);
+    
+    // Get SPL token balance for an address (returns token amount in smallest unit)
+    "get_spl_token_balance": (text, text) -> (variant { Ok: nat64; Err: text });
+    
+    // Verify SPL token transaction
+    "verify_spl_token_transaction": (text, nat64, text, text) -> (Result_Bool);
 
     // ============ Update Functions - Order Management ============
     // Create a new swap order
