@@ -6,7 +6,6 @@
 
 - [What is IntentSwaps?](#what-is-intentswaps)
 - [Rationale & Benefits](#rationale--benefits)
-- [Similarities with 1inch Fusion+](#similarities-with-1inch-fusion)
 - [How It Works](#how-it-works)
 - [Architecture](#architecture)
 - [Live Example Transaction](#live-example-transaction)
